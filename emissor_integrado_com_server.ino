@@ -1,46 +1,87 @@
-#include <WiFi.h>              // biblioteca para conectar o ESP32 ao WiFi
-#include <WebServer.h>         // biblioteca para criar o servidor HTTP
-#include <ArduinoJson.h>       // biblioteca para montar/ler JSON
-#include "soc/soc.h"           // acesso a registradores internos do chip
-#include "soc/rtc_cntl_reg.h"  // registrador usado para desligar o brownout detector
-#include <vector>              // usado para guardar a lista de mensagens
+/*
+  ======================================================================
+  REC-WAVE - ESP32 Web Server Integrado (frontend + backend no mesmo .ino)
+  ======================================================================
 
-// dados da rede WiFi
-const char* ssid     = "Welinton";  // nome da rede
-const char* password = "W080601n";  // senha da rede
+  BIBLIOTECA NECESSARIA (instalar pelo Gerenciador de Bibliotecas):
+    - ArduinoJson (autor: Benoit Blanchon) - versao 6.x
 
-// servidor HTTP escutando na porta 80
+  O QUE ESSE CODIGO FAZ:
+    - Conecta a ESP32 na rede WiFi
+    - Serve o painel REC-WAVE (HTML/CSS/JS embutidos, sem arquivos externos)
+    - Implementa todas as rotas de API que o frontend chama:
+        GET  /api/chat            -> lista de mensagens do chat
+        POST /api/chat/send       -> enviar mensagem
+        POST /api/chat/quick      -> enviar mensagem rapida (OK, SOS, etc)
+        GET  /api/status          -> status do sistema (wifi, sinal, bateria...)
+        GET  /api/history         -> historico completo de mensagens
+        POST /api/history/clear   -> limpar historico
+        GET  /api/settings        -> configuracoes atuais
+        POST /api/settings/update -> salvar configuracoes
+        POST /api/settings/restart-> reiniciar a ESP32
+
+  IMPORTANTE - DADOS SIMULADOS:
+    Latencia e bateria sao simulados neste exemplo, pois dependem de
+    hardware que voce ainda nao especificou (ex: sensor de bateria,
+    modulo de comunicacao LoRa/radio, etc). Estao marcados com
+    comentarios "SIMULADO" abaixo -- troque pela leitura real do seu
+    hardware quando definir qual sensor/modulo vai usar.
+
+  Como usar:
+    1. Instale a biblioteca ArduinoJson
+    2. Troque SSID e SENHA pelos dados da sua rede
+    3. Selecione a placa ESP32 correta em Ferramentas > Placa
+    4. Faca upload
+    5. Abra o Monitor Serial (115200 baud) para ver o IP atribuido
+    6. Acesse esse IP no navegador
+  ======================================================================
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include <vector>
+
+// ======= CONFIGURACOES DA REDE =======
+const char* ssid     = "WorldServidor";
+const char* password = "eteclab31";
+
+// ======= SERVIDOR WEB NA PORTA 80 =======
 WebServer server(80);
 
-// pino do buzzer usado para transmitir o texto por frequência
+// ======= PROTOCOLO DE TRANSMISSAO POR FREQUENCIA (REC-WAVE) =======
+// Texto -> ASCII -> Binario -> Grupos de 3 bits -> Frequencias -> Buzzer
 const int BUZZER_PIN = 15;
 
-// frequências do protocolo de transmissão
-const int FREQUENCIA_CONTROLE = 4000; // marca início e fim da transmissão
-const int FREQUENCIA_BIT_0    = 3400; // bit solto final = 0
-const int FREQUENCIA_BIT_1    = 3700; // bit solto final = 1
+const int FREQUENCIA_CONTROLE = 4000; // marca INICIO/FIM da transmissao
+const int FREQUENCIA_BIT_0    = 3400; // bit final solto = 0
+const int FREQUENCIA_BIT_1    = 3700; // bit final solto = 1
 
-// estrutura que representa uma mensagem do chat
+// ======= ESTRUTURA DE MENSAGEM DO CHAT =======
 struct ChatMessage {
-  String text;  // texto da mensagem
-  String time;  // horário (uptime) em que foi registrada
-  String type;  // "in" = recebida, "out" = enviada
+  String text;
+  String time;
+  String type; // "in" (recebida) ou "out" (enviada)
 };
 
-std::vector<ChatMessage> messages;      // lista com todas as mensagens em memória
-unsigned int msgSentCount = 0;          // contador de mensagens enviadas
-unsigned int msgReceivedCount = 0;      // contador de mensagens recebidas
-const size_t MAX_MESSAGES = 100;        // limite máximo de mensagens guardadas
+std::vector<ChatMessage> messages;
+unsigned int msgSentCount = 0;
+unsigned int msgReceivedCount = 0;
+const size_t MAX_MESSAGES = 100; // limite para nao estourar a memoria
 
-// configurações ajustáveis do dispositivo
-String cfgDeviceName = "REC-WAVE 01";  // nome exibido no painel
-bool   cfgDarkMode   = true;           // se o tema escuro está ativo
-String cfgLanguage   = "Português";    // idioma da interface
+// ======= CONFIGURACOES DO DISPOSITIVO (aba "Config") =======
+bool   cfgDarkMode   = true;
+String cfgLanguage   = "Português";
 
-bool restartPending = false;  // sinaliza que um reinício foi solicitado
-unsigned long restartAt = 0;  // instante (millis) em que deve reiniciar
+// Flag para reiniciar apos responder a requisicao HTTP
+bool restartPending = false;
+unsigned long restartAt = 0;
 
-// página HTML/CSS/JS completa, guardada na memória de programa (PROGMEM)
+// ---------------------------------------------------------------
+// PAGINA HTML/CSS/JS EMBUTIDA (painel REC-WAVE completo)
+// ---------------------------------------------------------------
 const char htmlPage[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -90,7 +131,7 @@ const char htmlPage[] PROGMEM = R"rawliteral(
     .logo-container { display: flex; align-items: center; gap: 10px; }
     .logo-icon { color: var(--neon-green); font-size: 1.5rem; }
     .logo-text { font-size: 1.2rem; font-weight: 700; letter-spacing: 1px; }
-    .header-status { display: flex; align-items: center; gap: 15px; color: var(--text-muted); }
+    
     .tab-navigation { display: flex; padding: 10px 10px 0 10px; gap: 5px;
         border-bottom: 1px solid var(--border-color); overflow-x: auto; }
     .tab-btn { flex: 1; background: none; border: none; color: var(--text-muted);
@@ -110,10 +151,9 @@ const char htmlPage[] PROGMEM = R"rawliteral(
         align-items: center; margin-bottom: 20px; }
     .section-header h2 { font-size: 1.1rem; font-weight: 600; }
     .status-indicator { font-size: 0.8rem; display: flex; align-items: center; gap: 5px; }
-    .status-indicator::before { content: ''; width: 8px; height: 8px; border-radius: 50%; }
-    .status-indicator.online { color: var(--neon-green); }
-    .status-indicator.online::before { background-color: var(--neon-green);
-        box-shadow: 0 0 5px var(--neon-green); }
+    
+    
+    
     .chat-window { height: 300px; background-color: var(--bg-card);
         border-radius: 12px; padding: 15px; overflow-y: auto;
         display: flex; flex-direction: column; gap: 15px;
@@ -155,30 +195,25 @@ const char htmlPage[] PROGMEM = R"rawliteral(
     .status-value { display: flex; align-items: center; gap: 12px; }
     .val-text { display: block; font-weight: 600; font-size: 1rem; }
     .status-value small { color: var(--text-muted); font-size: 0.7rem; }
-    .dot { width: 12px; height: 12px; border-radius: 50%; }
-    .dot.online { background-color: var(--neon-green);
-        box-shadow: 0 0 8px var(--neon-green); }
+    
+    
     .icon-large { font-size: 1.5rem; color: var(--text-muted); }
     .active-neon { color: var(--neon-green) !important; }
-    .signal-bars { display: flex; align-items: flex-end; gap: 2px; height: 20px; }
-    .bar { width: 4px; background-color: #333; border-radius: 1px; }
-    body.light-theme .bar { background-color: #d3d8de; }
-    .bar:nth-child(1) { height: 20%; } .bar:nth-child(2) { height: 40%; }
-    .bar:nth-child(3) { height: 60%; } .bar:nth-child(4) { height: 80%; }
-    .bar:nth-child(5) { height: 100%; }
-    .bar.active { background-color: var(--neon-green); }
-    .battery-section { background-color: var(--bg-card);
-        border: 1px solid var(--border-color); border-radius: 12px; padding: 15px; }
-    .battery-section label { font-size: 0.8rem; color: var(--text-muted);
-        margin-bottom: 10px; display: block; }
-    .battery-container { display: flex; align-items: center; gap: 15px; }
-    .battery-container i { color: var(--neon-green); font-size: 1.2rem; }
-    .battery-bar-bg { flex: 1; height: 8px; background-color: #232d38;
-        border-radius: 4px; overflow: hidden; }
-    body.light-theme .battery-bar-bg { background-color: #e2e6eb; }
-    .battery-bar-fill { height: 100%; background-color: var(--neon-green);
-        box-shadow: 0 0 10px var(--neon-green); }
-    .battery-pct { font-weight: 600; font-size: 0.9rem; }
+    
+    
+    body.light-theme 
+     
+     
+    
+    
+    
+    
+    
+    
+    
+    body.light-theme 
+    
+    
     .header-actions { display: flex; gap: 10px; }
     .search-box { position: relative; flex: 1; }
     .search-box input { width: 100%; background-color: var(--bg-input);
@@ -256,9 +291,7 @@ const char htmlPage[] PROGMEM = R"rawliteral(
             <i class="fas fa-wave-square logo-icon"></i>
             <h1 class="logo-text">REC-WAVE</h1>
         </div>
-        <div class="header-status">
-            <span id="device-name-header">REC-WAVE 01</span>
-        </div>
+      
     </header>
     <nav class="tab-navigation">
         <button class="tab-btn active" data-tab="chat">
@@ -299,43 +332,11 @@ const char htmlPage[] PROGMEM = R"rawliteral(
                 </div>
             </div>
         </section>
-        <section id="system" class="tab-content">
+                <section id="system" class="tab-content">
             <div class="section-header">
                 <h2 data-i18n="systemStatus">Status do Sistema</h2>
             </div>
             <div class="grid-container">
-                <div class="status-card">
-                    <label data-i18n="connection">Conexão</label>
-                    <div class="status-value">
-                        <span class="dot"></span>
-                        <div><span class="val-text">--</span><small>--</small></div>
-                    </div>
-                </div>
-                <div class="status-card">
-                    <label data-i18n="signalQuality">Qualidade do sinal</label>
-                    <div class="status-value">
-                        <div class="signal-bars">
-                            <div class="bar"></div><div class="bar"></div>
-                            <div class="bar"></div><div class="bar"></div>
-                            <div class="bar"></div>
-                        </div>
-                        <div><span class="val-text">--</span><small>--</small></div>
-                    </div>
-                </div>
-                <div class="status-card">
-                    <label data-i18n="latency">Latência</label>
-                    <div class="status-value">
-                        <i class="far fa-clock icon-large"></i>
-                        <div><span class="val-text">--</span><small data-i18n="responseTime">Tempo de resposta</small></div>
-                    </div>
-                </div>
-                <div class="status-card">
-                    <label data-i18n="commStatus">Status da comunicação</label>
-                    <div class="status-value">
-                        <i class="fas fa-wave-square icon-large"></i>
-                        <div><span class="val-text">--</span><small>--</small></div>
-                    </div>
-                </div>
                 <div class="status-card">
                     <label data-i18n="msgSent">Mensagens enviadas</label>
                     <div class="status-value">
@@ -349,16 +350,6 @@ const char htmlPage[] PROGMEM = R"rawliteral(
                         <i class="fas fa-download icon-large"></i>
                         <div><span class="val-text">--</span><small data-i18n="total">Total</small></div>
                     </div>
-                </div>
-            </div>
-            <div class="battery-section">
-                <label data-i18n="battery">Bateria (ESP32)</label>
-                <div class="battery-container">
-                    <i class="fas fa-battery-three-quarters"></i>
-                    <div class="battery-bar-bg">
-                        <div class="battery-bar-fill" style="width: 0%;"></div>
-                    </div>
-                    <span class="battery-pct">--</span>
                 </div>
             </div>
         </section>
@@ -389,12 +380,7 @@ const char htmlPage[] PROGMEM = R"rawliteral(
                 <h2 data-i18n="settingsTitle">Configurações</h2>
             </div>
             <div class="settings-list">
-                <div class="setting-item">
-                    <div class="setting-label">
-                        <i class="far fa-user"></i> <span data-i18n="deviceName">Nome do dispositivo</span>
-                    </div>
-                    <input type="text" value="REC-WAVE 01">
-                </div>
+              
                 <div class="setting-item">
                     <div class="setting-label">
                         <i class="far fa-moon"></i> <span data-i18n="darkMode">Modo escuro</span>
@@ -440,51 +426,40 @@ const char htmlPage[] PROGMEM = R"rawliteral(
 <script>
 const BASE = "";
 
+// ---------------------------------------------------------------
+// TRADUCOES (PT / EN)
+// ---------------------------------------------------------------
 const translations = {
-  'Português': {
+    'Português': {
     tabChat: 'Chat', tabStatus: 'Status', tabHistory: 'Histórico',
     tabSettings: 'Config', tabExtras: 'Extras',
     chatTitle: 'Conversa', connected: 'Conectado', disconnected: 'Desconectado',
     msgPlaceholder: 'Digite sua mensagem...', send: 'Enviar',
     quickMsgs: 'Mensagens rápidas',
-    systemStatus: 'Status do Sistema', connection: 'Conexão',
-    signalQuality: 'Qualidade do sinal', latency: 'Latência',
-    responseTime: 'Tempo de resposta', commStatus: 'Status da comunicação',
-    msgSent: 'Mensagens enviadas', msgReceived: 'Mensagens recebidas',
-    total: 'Total', battery: 'Bateria (ESP32)',
-    msgHistory: 'Histórico de Mensagens', searchMsg: 'Buscar mensagem...',
+    systemStatus: 'Status do Sistema', msgSent: 'Mensagens enviadas', msgReceived: 'Mensagens recebidas',
+    total: 'Total', msgHistory: 'Histórico de Mensagens', searchMsg: 'Buscar mensagem...',
     clear: 'Limpar', settingsTitle: 'Configurações',
-    deviceName: 'Nome do dispositivo', darkMode: 'Modo escuro',
+    darkMode: 'Modo escuro',
     language: 'Idioma', restartSystem: 'Reiniciar sistema', restart: 'Reiniciar',
     extrasEmpty: 'Em breve.',
     footerTagline: 'REC-WAVE - Comunicação que atravessa as águas.', version: 'Versão',
-    online: 'Online', offline: 'Offline', noConnection: 'Sem conexão',
-    excellent: 'Excelente', good: 'Bom', fair: 'Regular', weak: 'Fraco',
-    active: 'Ativa', inactive: 'Inativa', uptime: 'Uptime',
     waitingData: 'Aguardando dados...', received: 'Recebida', sent: 'Enviada',
     confirmClearHistory: 'Limpar todo o histórico?',
     confirmRestart: 'Reiniciar o sistema?', restarting: 'Reiniciando...'
   },
-  'English': {
+    'English': {
     tabChat: 'Chat', tabStatus: 'Status', tabHistory: 'History',
     tabSettings: 'Settings', tabExtras: 'Extras',
     chatTitle: 'Conversation', connected: 'Connected', disconnected: 'Disconnected',
     msgPlaceholder: 'Type your message...', send: 'Send',
     quickMsgs: 'Quick messages',
-    systemStatus: 'System Status', connection: 'Connection',
-    signalQuality: 'Signal quality', latency: 'Latency',
-    responseTime: 'Response time', commStatus: 'Communication status',
-    msgSent: 'Messages sent', msgReceived: 'Messages received',
-    total: 'Total', battery: 'Battery (ESP32)',
-    msgHistory: 'Message History', searchMsg: 'Search message...',
+    systemStatus: 'System Status', msgSent: 'Messages sent', msgReceived: 'Messages received',
+    total: 'Total', msgHistory: 'Message History', searchMsg: 'Search message...',
     clear: 'Clear', settingsTitle: 'Settings',
-    deviceName: 'Device name', darkMode: 'Dark mode',
+    darkMode: 'Dark mode',
     language: 'Language', restartSystem: 'Restart system', restart: 'Restart',
     extrasEmpty: 'Coming soon.',
     footerTagline: 'REC-WAVE - Communication that crosses the waters.', version: 'Version',
-    online: 'Online', offline: 'Offline', noConnection: 'No connection',
-    excellent: 'Excellent', good: 'Good', fair: 'Fair', weak: 'Weak',
-    active: 'Active', inactive: 'Inactive', uptime: 'Uptime',
     waitingData: 'Waiting for data...', received: 'Received', sent: 'Sent',
     confirmClearHistory: 'Clear the entire history?',
     confirmRestart: 'Restart the system?', restarting: 'Restarting...'
@@ -582,33 +557,8 @@ async function loadStatus() {
     const res = await fetch(BASE + '/api/status');
     const data = await res.json();
     const cards = document.querySelectorAll('.status-card');
-
-    const dot = cards[0].querySelector('.dot');
-    dot.className = 'dot' + (data.connected ? ' online' : '');
-    cards[0].querySelector('.val-text').textContent = data.connected ? t('online') : t('offline');
-    cards[0].querySelector('small').textContent = data.connected ? data.wifiMode : t('noConnection');
-
-    const rssi = data.rssi;
-    const bars = cards[1].querySelectorAll('.bar');
-    const barCount = Math.min(5, Math.max(0, Math.round((rssi + 100) / 20)));
-    bars.forEach((b, i) => b.classList.toggle('active', i < barCount));
-    cards[1].querySelector('.val-text').textContent = rssi + ' dBm';
-    cards[1].querySelector('small').textContent =
-      (rssi >= -50) ? t('excellent') : (rssi >= -70) ? t('good') : (rssi >= -85) ? t('fair') : t('weak');
-
-    cards[2].querySelector('.val-text').textContent = data.latency + ' ms';
-
-    const commIcon = cards[3].querySelector('.icon-large');
-    commIcon.className = 'fas fa-wave-square icon-large' + (data.connected ? ' active-neon' : '');
-    cards[3].querySelector('.val-text').textContent = data.connected ? t('active') : t('inactive');
-    cards[3].querySelector('small').textContent = data.connected ? t('uptime') + ': ' + data.uptime : '--';
-
-    cards[4].querySelector('.val-text').textContent = data.msgSent;
-    cards[5].querySelector('.val-text').textContent = data.msgReceived;
-
-    const batPct = data.battery;
-    document.querySelector('.battery-bar-fill').style.width = batPct + '%';
-    document.querySelector('.battery-pct').textContent = batPct + '%';
+    cards[0].querySelector('.val-text').textContent = data.msgSent;
+    cards[1].querySelector('.val-text').textContent = data.msgReceived;
   } catch (e) { console.log('Erro status:', e); }
 }
 
@@ -685,10 +635,10 @@ document.querySelector('.btn-outline-danger').addEventListener('click', async ()
 function getEl() {
   const items = document.querySelectorAll('.setting-item');
   return {
-    name:   items[0].querySelector('input'),
-    dark:   items[1].querySelector('input[type=checkbox]'),
-    lang:   items[2].querySelector('select'),
-    rstBtn: items[3].querySelector('button')
+  
+    dark:   items[0].querySelector('input[type=checkbox]'),
+    lang:   items[1].querySelector('select'),
+    rstBtn: items[2].querySelector('button')
   };
 }
 
@@ -697,13 +647,13 @@ async function loadSettings() {
     const res = await fetch(BASE + '/api/settings');
     const data = await res.json();
     const el = getEl();
-    el.name.value = data.deviceName;
+  
     el.dark.checked = data.darkMode;
     el.lang.value = data.language;
     currentLang = data.language;
     applyTheme(data.darkMode);
     applyStaticTranslations();
-    document.getElementById('device-name-header').textContent = data.deviceName;
+  
   } catch (e) { console.log('Erro settings:', e); }
 }
 
@@ -725,7 +675,7 @@ document.addEventListener('DOMContentLoaded', () => {
 async function saveSettings() {
   const el = getEl();
   const payload = {
-    deviceName: el.name.value,
+  
     darkMode: el.dark.checked,
     language: el.lang.value
   };
@@ -736,7 +686,7 @@ async function saveSettings() {
       body: JSON.stringify(payload)
     });
     const data = await res.json();
-    document.getElementById('device-name-header').textContent = data.deviceName;
+  
   } catch (e) { console.log('Erro salvar config:', e); }
 }
 
@@ -775,283 +725,286 @@ loadSettings();
 </html>
 )rawliteral";
 
-// devolve o tempo desde o boot no formato HH:MM:SS
+// ---------------------------------------------------------------
+// FUNCOES AUXILIARES
+// ---------------------------------------------------------------
+
+// Formata o tempo decorrido desde o boot como HH:MM:SS
 String formatUptime() {
-  unsigned long secs = millis() / 1000;         // converte millis em segundos
-  unsigned int h = (secs / 3600) % 24;           // calcula as horas
-  unsigned int m = (secs / 60) % 60;             // calcula os minutos
-  unsigned int s = secs % 60;                    // calcula os segundos restantes
-  char buf[9];                                   // buffer para montar o texto
-  snprintf(buf, sizeof(buf), "%02u:%02u:%02u", h, m, s); // formata como texto
-  return String(buf);                            // retorna como String
+  unsigned long secs = millis() / 1000;
+  unsigned int h = (secs / 3600) % 24;
+  unsigned int m = (secs / 60) % 60;
+  unsigned int s = secs % 60;
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02u:%02u:%02u", h, m, s);
+  return String(buf);
 }
 
-// guarda uma nova mensagem no histórico do chat
+// Adiciona uma mensagem ao historico do chat
 void addMessage(const String &text, const String &type) {
-  ChatMessage m;                 // cria uma mensagem nova
-  m.text = text;                 // define o texto
-  m.time = formatUptime();       // marca o horário atual
-  m.type = type;                 // define se é enviada ou recebida
-  messages.push_back(m);         // adiciona no fim da lista
-  if (messages.size() > MAX_MESSAGES) { // se passou do limite...
-    messages.erase(messages.begin());   // remove a mensagem mais antiga
+  ChatMessage m;
+  m.text = text;
+  m.time = formatUptime();
+  m.type = type;
+  messages.push_back(m);
+  if (messages.size() > MAX_MESSAGES) {
+    messages.erase(messages.begin());
   }
-  if (type == "out") msgSentCount++;    // conta como enviada
-  else msgReceivedCount++;              // ou conta como recebida
+  if (type == "out") msgSentCount++;
+  else msgReceivedCount++;
 }
 
-// converte um grupo de 3 bits na frequência correspondente
+// ------------------------------------------------------
+// Tabela de frequencias dos grupos de 3 bits
+// ------------------------------------------------------
 int obterFrequencia(String bits) {
-  if (bits == "000") return 1000;  // grupo 000 -> 1000 Hz
-  if (bits == "001") return 1300;  // grupo 001 -> 1300 Hz
-  if (bits == "010") return 1600;  // grupo 010 -> 1600 Hz
-  if (bits == "011") return 1900;  // grupo 011 -> 1900 Hz
-  if (bits == "100") return 2200;  // grupo 100 -> 2200 Hz
-  if (bits == "101") return 2500;  // grupo 101 -> 2500 Hz
-  if (bits == "110") return 2800;  // grupo 110 -> 2800 Hz
-  if (bits == "111") return 3100;  // grupo 111 -> 3100 Hz
-  return -1;                       // grupo inválido
+  if (bits == "000") return 1000;
+  if (bits == "001") return 1300;
+  if (bits == "010") return 1600;
+  if (bits == "011") return 1900;
+  if (bits == "100") return 2200;
+  if (bits == "101") return 2500;
+  if (bits == "110") return 2800;
+  if (bits == "111") return 3100;
+  return -1;
 }
 
-// toca uma frequência no buzzer por um tempo determinado
+// Emite um bip de uma frequencia por um tempo determinado
 void emitirBip(int frequencia, int tempo) {
-  tone(BUZZER_PIN, frequencia); // liga o buzzer na frequência escolhida
-  delay(tempo);                 // mantém o som tocando pelo tempo definido
-  noTone(BUZZER_PIN);           // desliga o buzzer
-  delay(100);                   // pequena pausa entre os bips
+  tone(BUZZER_PIN, frequencia);
+  delay(tempo);
+  noTone(BUZZER_PIN);
+  delay(100);
 }
 
-// converte o texto em binário e transmite pelo buzzer (função bloqueante)
+// Converte o texto em binario e transmite via buzzer seguindo
+// o protocolo REC-WAVE (bloqueante: o servidor web fica pausado
+// durante a transmissao)
 void transmitirTexto(const String &texto) {
-  String binario = "";                          // string que vai acumular os bits
-  for (unsigned int i = 0; i < texto.length(); i++) { // percorre cada caractere do texto
-    char c = texto[i];                          // pega o caractere atual
-    for (int b = 7; b >= 0; b--) {               // percorre os 8 bits do caractere
-      binario += (c & (1 << b)) ? "1" : "0";     // adiciona "1" ou "0" conforme o bit
+  String binario = "";
+  for (unsigned int i = 0; i < texto.length(); i++) {
+    char c = texto[i];
+    for (int b = 7; b >= 0; b--) {
+      binario += (c & (1 << b)) ? "1" : "0";
     }
   }
 
-  Serial.println();                 // pula uma linha no monitor serial
-  Serial.print("Transmitindo: ");   // rótulo de log
-  Serial.println(texto);            // mostra o texto que será transmitido
-  Serial.print("Binario: ");        // rótulo de log
-  Serial.println(binario);          // mostra a sequência binária gerada
+  Serial.println();
+  Serial.print("Transmitindo: ");
+  Serial.println(texto);
+  Serial.print("Binario: ");
+  Serial.println(binario);
 
-  emitirBip(FREQUENCIA_CONTROLE, 500); // emite o sinal de início da transmissão
+  // Controle de INICIO
+  emitirBip(FREQUENCIA_CONTROLE, 500);
 
-  int tamanho = binario.length();  // tamanho total da sequência de bits
-  int i = 0;                       // posição atual na sequência
-  while (i + 3 <= tamanho) {                 // enquanto houver grupos completos de 3 bits
-    String grupo = binario.substring(i, i + 3); // extrai o grupo de 3 bits
-    int freq = obterFrequencia(grupo);           // converte o grupo em frequência
-    emitirBip(freq, 300);                        // emite o bip correspondente
-    i += 3;                                      // avança para o próximo grupo
+  // Transmite os dados em grupos de 3 bits
+  int tamanho = binario.length();
+  int i = 0;
+  while (i + 3 <= tamanho) {
+    String grupo = binario.substring(i, i + 3);
+    int freq = obterFrequencia(grupo);
+    emitirBip(freq, 300);
+    i += 3;
   }
 
-  while (i < tamanho) {                 // trata os bits restantes que não formam um grupo de 3
-    char bit = binario[i];              // pega o bit atual
-    if (bit == '0') emitirBip(FREQUENCIA_BIT_0, 300); // emite frequência de bit 0
-    else            emitirBip(FREQUENCIA_BIT_1, 300); // emite frequência de bit 1
-    i++;                                 // avança para o próximo bit
+  // Bits finais que sobraram (nao completam um grupo de 3)
+  while (i < tamanho) {
+    char bit = binario[i];
+    if (bit == '0') emitirBip(FREQUENCIA_BIT_0, 300);
+    else            emitirBip(FREQUENCIA_BIT_1, 300);
+    i++;
   }
 
-  emitirBip(FREQUENCIA_CONTROLE, 500); // emite o sinal de fim da transmissão
+  // Controle de FIM
+  emitirBip(FREQUENCIA_CONTROLE, 500);
 
-  Serial.println("Transmissao concluida."); // log de conclusão
+  Serial.println("Transmissao concluida.");
 }
 
-// leitura da porcentagem de bateria (fixa até haver sensor real)
-int readBatteryPercent() {
-  return 82; // valor fixo, trocar por leitura de um pino ADC futuramente
-}
 
-// leitura da latência de comunicação (calculada a partir do millis por enquanto)
-int simulateLatency() {
-  return 20 + (millis() % 40); // gera um valor variável entre 20 e 59 ms
-}
 
-// entrega a página HTML principal ao navegador
+// ---------------------------------------------------------------
+// HANDLERS DE ROTAS
+// ---------------------------------------------------------------
+
 void handleRoot() {
-  server.send_P(200, "text/html", htmlPage); // envia a página guardada em PROGMEM
+  server.send_P(200, "text/html", htmlPage);
 }
 
-// monta o JSON com a lista de mensagens e envia como resposta
+// Serializa a lista de mensagens em JSON e envia
 void sendMessagesJson() {
-  DynamicJsonDocument doc(8192);           // documento JSON com espaço reservado
-  JsonArray arr = doc.createNestedArray("messages"); // cria o array "messages"
-  for (auto &m : messages) {               // percorre todas as mensagens guardadas
-    JsonObject o = arr.createNestedObject(); // cria um objeto JSON para cada mensagem
-    o["text"] = m.text;                      // grava o texto
-    o["time"] = m.time;                      // grava o horário
-    o["type"] = m.type;                      // grava o tipo (in/out)
+  DynamicJsonDocument doc(8192);
+  JsonArray arr = doc.createNestedArray("messages");
+  for (auto &m : messages) {
+    JsonObject o = arr.createNestedObject();
+    o["text"] = m.text;
+    o["time"] = m.time;
+    o["type"] = m.type;
   }
-  String out;                    // string que vai receber o JSON serializado
-  serializeJson(doc, out);       // converte o documento em texto JSON
-  server.send(200, "application/json", out); // envia a resposta ao cliente
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
-// rota GET /api/chat -> retorna as mensagens do chat
 void handleGetChat() {
-  sendMessagesJson(); // reaproveita a função que monta o JSON
+  sendMessagesJson();
 }
 
-// rota GET /api/history -> retorna o histórico completo
 void handleGetHistory() {
-  sendMessagesJson(); // reaproveita a mesma lista de mensagens
+  sendMessagesJson();
 }
 
-// rota POST /api/chat/send -> recebe e processa uma nova mensagem enviada
+// Le {"message": "..."} do corpo da requisicao e adiciona como mensagem enviada
 void handlePostChatSend() {
-  if (!server.hasArg("plain")) {           // verifica se veio corpo na requisição
-    server.send(400, "application/json", "{\"error\":\"corpo vazio\"}"); // erro se não veio
-    return;                                // interrompe a função
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"error\":\"corpo vazio\"}");
+    return;
   }
-  StaticJsonDocument<256> doc;             // documento para interpretar o JSON recebido
-  DeserializationError err = deserializeJson(doc, server.arg("plain")); // tenta ler o JSON
-  if (err) {                               // se houve erro ao interpretar
-    server.send(400, "application/json", "{\"error\":\"json invalido\"}"); // responde com erro
-    return;                                // interrompe a função
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) {
+    server.send(400, "application/json", "{\"error\":\"json invalido\"}");
+    return;
   }
-  String text = doc["message"] | "";       // extrai o campo "message" (vazio se não existir)
-  if (text.length() == 0) {                // verifica se a mensagem está vazia
-    server.send(400, "application/json", "{\"error\":\"mensagem vazia\"}"); // responde com erro
-    return;                                // interrompe a função
+  String text = doc["message"] | "";
+  if (text.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"mensagem vazia\"}");
+    return;
   }
-  addMessage(text, "out");                 // salva a mensagem como enviada
-  server.send(200, "application/json", "{\"ok\":true}"); // confirma o recebimento ao navegador
+  addMessage(text, "out");
+  server.send(200, "application/json", "{\"ok\":true}");
 
-  transmitirTexto(text); // transmite o texto pelo buzzer (função bloqueante)
+  // Responde ao navegador primeiro, depois transmite pelo buzzer
+  // (a transmissao e bloqueante: o servidor fica pausado ate terminar)
+  transmitirTexto(text);
 }
 
-// rota POST /api/chat/quick -> mensagens rápidas usam a mesma lógica do envio normal
+// Mesma logica do envio normal, usada pelos botoes de mensagem rapida
 void handlePostChatQuick() {
-  handlePostChatSend(); // reaproveita a função de envio de mensagem
+  handlePostChatSend();
 }
 
-// rota POST /api/history/clear -> apaga todo o histórico de mensagens
 void handlePostHistoryClear() {
-  messages.clear();          // esvazia a lista de mensagens
-  msgSentCount = 0;          // zera o contador de enviadas
-  msgReceivedCount = 0;      // zera o contador de recebidas
-  server.send(200, "application/json", "{\"ok\":true}"); // confirma a limpeza
+  messages.clear();
+  msgSentCount = 0;
+  msgReceivedCount = 0;
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// rota GET /api/status -> retorna o status atual do sistema
 void handleGetStatus() {
-  bool connected = (WiFi.status() == WL_CONNECTED); // verifica se o WiFi está conectado
-  DynamicJsonDocument doc(512);      // documento JSON para montar a resposta
-  doc["connected"]    = connected;              // informa se está conectado
-  doc["wifiMode"]     = "STA";                  // modo do WiFi (estação)
-  doc["rssi"]         = connected ? WiFi.RSSI() : -100; // força do sinal
-  doc["latency"]      = simulateLatency();      // latência atual
-  doc["uptime"]       = formatUptime();         // tempo ligado
-  doc["msgSent"]      = msgSentCount;           // total de mensagens enviadas
-  doc["msgReceived"]  = msgReceivedCount;       // total de mensagens recebidas
-  doc["battery"]      = readBatteryPercent();   // porcentagem da bateria
-  String out;                        // string para o JSON final
-  serializeJson(doc, out);           // serializa o documento em texto
-  server.send(200, "application/json", out); // envia a resposta
+
+  DynamicJsonDocument doc(512);
+    doc["msgSent"]      = msgSentCount;
+  doc["msgReceived"]  = msgReceivedCount;
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
-// rota GET /api/settings -> retorna as configurações atuais
 void handleGetSettings() {
-  DynamicJsonDocument doc(512);   // documento JSON para as configurações
-  doc["deviceName"] = cfgDeviceName; // nome do dispositivo
-  doc["darkMode"]   = cfgDarkMode;   // estado do modo escuro
-  doc["language"]   = cfgLanguage;   // idioma atual
-  String out;                     // string para o JSON final
-  serializeJson(doc, out);        // serializa o documento
-  server.send(200, "application/json", out); // envia a resposta
+  DynamicJsonDocument doc(512);
+
+  doc["darkMode"]   = cfgDarkMode;
+  doc["language"]   = cfgLanguage;
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
-// rota POST /api/settings/update -> atualiza as configurações do dispositivo
 void handlePostSettingsUpdate() {
-  if (!server.hasArg("plain")) {      // verifica se a requisição tem corpo
-    server.send(400, "application/json", "{\"error\":\"corpo vazio\"}"); // erro se não tiver
-    return;                           // interrompe a função
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"error\":\"corpo vazio\"}");
+    return;
   }
-  StaticJsonDocument<512> doc;        // documento para interpretar o JSON recebido
-  DeserializationError err = deserializeJson(doc, server.arg("plain")); // tenta ler o JSON
-  if (err) {                          // se houve erro na leitura
-    server.send(400, "application/json", "{\"error\":\"json invalido\"}"); // responde com erro
-    return;                           // interrompe a função
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) {
+    server.send(400, "application/json", "{\"error\":\"json invalido\"}");
+    return;
   }
-  if (doc.containsKey("deviceName")) cfgDeviceName = doc["deviceName"].as<String>(); // atualiza nome
-  if (doc.containsKey("darkMode"))   cfgDarkMode   = doc["darkMode"].as<bool>();     // atualiza tema
-  if (doc.containsKey("language"))   cfgLanguage   = doc["language"].as<String>();   // atualiza idioma
 
-  handleGetSettings(); // responde já com as configurações atualizadas
+  if (doc.containsKey("darkMode"))   cfgDarkMode   = doc["darkMode"].as<bool>();
+  if (doc.containsKey("language"))   cfgLanguage   = doc["language"].as<String>();
+
+  handleGetSettings(); // responde com as configuracoes atualizadas
 }
 
-// rota POST /api/settings/restart -> agenda o reinício da ESP32
 void handlePostSettingsRestart() {
-  server.send(200, "application/json", "{\"ok\":true,\"message\":\"Reiniciando...\"}"); // confirma antes de reiniciar
-  restartPending = true;         // sinaliza que o reinício deve acontecer
-  restartAt = millis() + 500;    // agenda o reinício meio segundo à frente
+  server.send(200, "application/json", "{\"ok\":true,\"message\":\"Reiniciando...\"}");
+  restartPending = true;
+  restartAt = millis() + 500; // da tempo da resposta HTTP ser enviada
 }
 
-// rota usada quando nenhuma outra rota corresponde ao pedido
 void handleNotFound() {
-  server.send(404, "application/json", "{\"error\":\"rota nao encontrada\"}"); // responde com erro 404
+  server.send(404, "application/json", "{\"error\":\"rota nao encontrada\"}");
 }
 
-// configuração inicial, executada uma única vez ao ligar a ESP32
+// ---------------------------------------------------------------
+// SETUP
+// ---------------------------------------------------------------
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desativa o detector de brownout
+  // Desativa o detector de brownout (evita resets falsos por
+  // picos de corrente do radio WiFi em fontes/cabos fracos)
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
-  Serial.begin(115200); // inicia a comunicação serial em 115200 baud
-  delay(1000);           // aguarda a serial estabilizar
+  Serial.begin(115200);
+  delay(1000);
 
-  pinMode(BUZZER_PIN, OUTPUT); // configura o pino do buzzer como saída
+  pinMode(BUZZER_PIN, OUTPUT);
 
-  Serial.println();                    // pula uma linha no log
-  Serial.print("Conectando na rede: "); // mensagem de log
-  Serial.println(ssid);                 // mostra o nome da rede
+  Serial.println();
+  Serial.print("Conectando na rede: ");
+  Serial.println(ssid);
 
-  WiFi.mode(WIFI_STA);                    // define o ESP32 como estação WiFi (cliente)
-  WiFi.setTxPower(WIFI_POWER_11dBm);      // reduz a potência de transmissão para evitar picos de corrente
-  WiFi.begin(ssid, password);             // inicia a conexão com a rede
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_11dBm); // reduz pico de corrente na conexao
+  WiFi.begin(ssid, password);
 
-  int tentativas = 0;                                    // contador de tentativas de conexão
-  while (WiFi.status() != WL_CONNECTED && tentativas < 40) { // espera até conectar ou atingir o limite
-    delay(500);          // aguarda meio segundo entre tentativas
-    Serial.print(".");   // mostra progresso no log
-    tentativas++;        // incrementa o contador
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativas < 40) {
+    delay(500);
+    Serial.print(".");
+    tentativas++;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {      // se a conexão foi bem-sucedida
-    Serial.println();                        // pula linha
-    Serial.println("WiFi conectado com sucesso!"); // log de sucesso
-    Serial.print("Acesse o painel em: http://");    // instrução de acesso
-    Serial.println(WiFi.localIP());          // mostra o IP atribuído
-  } else {                                   // se não conseguiu conectar
-    Serial.println();                        // pula linha
-    Serial.println("Falha ao conectar no WiFi. Verifique SSID/senha."); // log de falha
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi conectado com sucesso!");
+    Serial.print("Acesse o painel em: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("Falha ao conectar no WiFi. Verifique SSID/senha.");
   }
 
-  addMessage("Sistema iniciado. Pronto para comunicacao.", "in"); // mensagem inicial no chat
+  // Mensagem inicial de boas-vindas no chat
+  addMessage("Sistema iniciado. Pronto para comunicacao.", "in");
 
-  server.on("/", HTTP_GET, handleRoot);                          // rota da página principal
-  server.on("/api/chat", HTTP_GET, handleGetChat);                // rota de leitura do chat
-  server.on("/api/chat/send", HTTP_POST, handlePostChatSend);     // rota de envio de mensagem
-  server.on("/api/chat/quick", HTTP_POST, handlePostChatQuick);   // rota de mensagem rápida
-  server.on("/api/status", HTTP_GET, handleGetStatus);            // rota de status do sistema
-  server.on("/api/history", HTTP_GET, handleGetHistory);          // rota de histórico
-  server.on("/api/history/clear", HTTP_POST, handlePostHistoryClear); // rota de limpar histórico
-  server.on("/api/settings", HTTP_GET, handleGetSettings);        // rota de leitura das configurações
-  server.on("/api/settings/update", HTTP_POST, handlePostSettingsUpdate); // rota de salvar configurações
-  server.on("/api/settings/restart", HTTP_POST, handlePostSettingsRestart); // rota de reiniciar
-  server.onNotFound(handleNotFound);                              // rota padrão para caminhos inexistentes
+  // Registra as rotas
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/chat", HTTP_GET, handleGetChat);
+  server.on("/api/chat/send", HTTP_POST, handlePostChatSend);
+  server.on("/api/chat/quick", HTTP_POST, handlePostChatQuick);
+  server.on("/api/status", HTTP_GET, handleGetStatus);
+  server.on("/api/history", HTTP_GET, handleGetHistory);
+  server.on("/api/history/clear", HTTP_POST, handlePostHistoryClear);
+  server.on("/api/settings", HTTP_GET, handleGetSettings);
+  server.on("/api/settings/update", HTTP_POST, handlePostSettingsUpdate);
+  server.on("/api/settings/restart", HTTP_POST, handlePostSettingsRestart);
+  server.onNotFound(handleNotFound);
 
-  server.begin();                          // inicia o servidor HTTP
-  Serial.println("Servidor HTTP iniciado."); // log de confirmação
+  server.begin();
+  Serial.println("Servidor HTTP iniciado.");
 }
 
-// laço principal, executado continuamente após o setup
+// ---------------------------------------------------------------
+// LOOP
+// ---------------------------------------------------------------
 void loop() {
-  server.handleClient(); // processa as requisições HTTP recebidas
+  server.handleClient();
 
-  if (restartPending && millis() >= restartAt) { // verifica se já é hora de reiniciar
-    ESP.restart();                                // reinicia a ESP32
+  if (restartPending && millis() >= restartAt) {
+    ESP.restart();
   }
 }
