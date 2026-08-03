@@ -1,41 +1,3 @@
-/*
-  ======================================================================
-  REC-WAVE - ESP32 Web Server Integrado (frontend + backend no mesmo .ino)
-  ======================================================================
-
-  BIBLIOTECA NECESSARIA (instalar pelo Gerenciador de Bibliotecas):
-    - ArduinoJson (autor: Benoit Blanchon) - versao 6.x
-
-  O QUE ESSE CODIGO FAZ:
-    - Conecta a ESP32 na rede WiFi
-    - Serve o painel REC-WAVE (HTML/CSS/JS embutidos, sem arquivos externos)
-    - Implementa todas as rotas de API que o frontend chama:
-        GET  /api/chat            -> lista de mensagens do chat
-        POST /api/chat/send       -> enviar mensagem
-        POST /api/chat/quick      -> enviar mensagem rapida (OK, SOS, etc)
-        GET  /api/status          -> status do sistema (wifi, sinal, bateria...)
-        GET  /api/history         -> historico completo de mensagens
-        POST /api/history/clear   -> limpar historico
-        GET  /api/settings        -> configuracoes atuais
-        POST /api/settings/update -> salvar configuracoes
-        POST /api/settings/restart-> reiniciar a ESP32
-
-  IMPORTANTE - DADOS SIMULADOS:
-    Latencia e bateria sao simulados neste exemplo, pois dependem de
-    hardware que voce ainda nao especificou (ex: sensor de bateria,
-    modulo de comunicacao LoRa/radio, etc). Estao marcados com
-    comentarios "SIMULADO" abaixo -- troque pela leitura real do seu
-    hardware quando definir qual sensor/modulo vai usar.
-
-  Como usar:
-    1. Instale a biblioteca ArduinoJson
-    2. Troque SSID e SENHA pelos dados da sua rede
-    3. Selecione a placa ESP32 correta em Ferramentas > Placa
-    4. Faca upload
-    5. Abra o Monitor Serial (115200 baud) para ver o IP atribuido
-    6. Acesse esse IP no navegador
-  ======================================================================
-*/
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -44,14 +6,14 @@
 #include "soc/rtc_cntl_reg.h"
 #include <vector>
 
-// ======= CONFIGURACOES DA REDE =======
+// CONFIGURACOES DA REDE
 const char* ssid     = "WorldServidor";
 const char* password = "eteclab31";
 
-// ======= SERVIDOR WEB NA PORTA 80 =======
+// SERVIDOR WEB NA PORTA 80
 WebServer server(80);
 
-// ======= PROTOCOLO DE TRANSMISSAO POR FREQUENCIA (REC-WAVE) =======
+// PROTOCOLO DE TRANSMISSAO POR FREQUENCIA (REC-WAVE)
 // Texto -> ASCII -> Binario -> Grupos de 3 bits -> Frequencias -> Buzzer
 const int BUZZER_PIN = 15;
 
@@ -59,7 +21,7 @@ const int FREQUENCIA_CONTROLE = 4000; // marca INICIO/FIM da transmissao
 const int FREQUENCIA_BIT_0    = 3400; // bit final solto = 0
 const int FREQUENCIA_BIT_1    = 3700; // bit final solto = 1
 
-// ======= ESTRUTURA DE MENSAGEM DO CHAT =======
+// ESTRUTURA DE MENSAGEM DO CHAT
 struct ChatMessage {
   String text;
   String time;
@@ -71,7 +33,7 @@ unsigned int msgSentCount = 0;
 unsigned int msgReceivedCount = 0;
 const size_t MAX_MESSAGES = 100; // limite para nao estourar a memoria
 
-// ======= CONFIGURACOES DO DISPOSITIVO (aba "Config") =======
+// CONFIGURACOES DO DISPOSITIVO (aba "Config")
 bool   cfgDarkMode   = true;
 String cfgLanguage   = "Português";
 
@@ -79,9 +41,7 @@ String cfgLanguage   = "Português";
 bool restartPending = false;
 unsigned long restartAt = 0;
 
-// ---------------------------------------------------------------
 // PAGINA HTML/CSS/JS EMBUTIDA (painel REC-WAVE completo)
-// ---------------------------------------------------------------
 const char htmlPage[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -152,8 +112,6 @@ const char htmlPage[] PROGMEM = R"rawliteral(
     .section-header h2 { font-size: 1.1rem; font-weight: 600; }
     .status-indicator { font-size: 0.8rem; display: flex; align-items: center; gap: 5px; }
     
-    
-    
     .chat-window { height: 300px; background-color: var(--bg-card);
         border-radius: 12px; padding: 15px; overflow-y: auto;
         display: flex; flex-direction: column; gap: 15px;
@@ -196,23 +154,12 @@ const char htmlPage[] PROGMEM = R"rawliteral(
     .val-text { display: block; font-weight: 600; font-size: 1rem; }
     .status-value small { color: var(--text-muted); font-size: 0.7rem; }
     
-    
     .icon-large { font-size: 1.5rem; color: var(--text-muted); }
     .active-neon { color: var(--neon-green) !important; }
     
-    
     body.light-theme 
      
-     
-    
-    
-    
-    
-    
-    
-    
     body.light-theme 
-    
     
     .header-actions { display: flex; gap: 10px; }
     .search-box { position: relative; flex: 1; }
@@ -426,9 +373,7 @@ const char htmlPage[] PROGMEM = R"rawliteral(
 <script>
 const BASE = "";
 
-// ---------------------------------------------------------------
 // TRADUCOES (PT / EN)
-// ---------------------------------------------------------------
 const translations = {
     'Português': {
     tabChat: 'Chat', tabStatus: 'Status', tabHistory: 'Histórico',
@@ -725,9 +670,7 @@ loadSettings();
 </html>
 )rawliteral";
 
-// ---------------------------------------------------------------
 // FUNCOES AUXILIARES
-// ---------------------------------------------------------------
 
 // Formata o tempo decorrido desde o boot como HH:MM:SS
 String formatUptime() {
@@ -754,9 +697,7 @@ void addMessage(const String &text, const String &type) {
   else msgReceivedCount++;
 }
 
-// ------------------------------------------------------
 // Tabela de frequencias dos grupos de 3 bits
-// ------------------------------------------------------
 int obterFrequencia(String bits) {
   if (bits == "000") return 1000;
   if (bits == "001") return 1300;
@@ -822,11 +763,7 @@ void transmitirTexto(const String &texto) {
   Serial.println("Transmissao concluida.");
 }
 
-
-
-// ---------------------------------------------------------------
 // HANDLERS DE ROTAS
-// ---------------------------------------------------------------
 
 void handleRoot() {
   server.send_P(200, "text/html", htmlPage);
@@ -940,9 +877,7 @@ void handleNotFound() {
   server.send(404, "application/json", "{\"error\":\"rota nao encontrada\"}");
 }
 
-// ---------------------------------------------------------------
 // SETUP
-// ---------------------------------------------------------------
 void setup() {
   // Desativa o detector de brownout (evita resets falsos por
   // picos de corrente do radio WiFi em fontes/cabos fracos)
@@ -998,9 +933,7 @@ void setup() {
   Serial.println("Servidor HTTP iniciado.");
 }
 
-// ---------------------------------------------------------------
 // LOOP
-// ---------------------------------------------------------------
 void loop() {
   server.handleClient();
 
