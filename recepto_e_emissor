@@ -1,0 +1,2286 @@
+/*
+=========================================================
+ REC-WAVE (v3)
+ RECEPTOR, EMISSOR E CONVERSOR
+ PROTOCOLO POR DURACAO DOS BIPS (SEM FREQUENCIA, SEM FFT)
+
+ Autor original: Tony Bonilha Vieira
+
+ MODOS (Monitor Serial, 115200 baud, "Nova linha"):
+ E       = Emitir (no menu inicial)
+ R       = Receber (no menu inicial)
+ :E      = Trocar para emissao
+ :R      = Trocar para recepcao
+ :F<hz>  = (emissor) testa o buzzer, 1200 a 3400 Hz
+ :C      = (receptor) liga/desliga a calibracao
+ :L<n>   = (receptor) ajusta o limiar minimo
+ :T<hz>  = (receptor) trava a escuta em torno de <hz> (:T0 = automatico)
+
+ SINAIS (identificados SOMENTE pela duracao do som):
+ 1000 ms = controle de inicio/fim da mensagem
+  400 ms = bip curto  (bit 0 / ponto Morse)
+  600 ms = bip longo  (bit 1 / traco Morse)
+  100 ms = modo NUMERICO para o PROXIMO caractere
+  200 ms = modo ESPECIAL para o PROXIMO caractere
+  300 ms = intervalo entre bips do mesmo caractere
+  900 ms = intervalo de fim de caractere (todos os modos)
+
+ MODOS DE IDENTIFICACAO (ABSOLUTOS, valem para 1 caractere):
+ ALFA     = padrao, sem sinal de modo. Morse de A a Z
+ NUMERICO = precedido por 100 ms. Tabela propria de 0 a 9
+ ESPECIAL = precedido por 200 ms. ASCII de 7 bits
+ Depois de cada caractere o receptor volta sozinho para ALFA.
+ Assim, um sinal de modo perdido ou inventado estraga no
+ maximo 1 caractere e nao desalinha o resto da mensagem.
+
+ INTEGRIDADE:
+ Antes do controle final o emissor envia 1 caractere de
+ checksum (modo ESPECIAL, ASCII 0x20-0x7E). O receptor
+ confere e informa se a mensagem chegou integra.
+
+ PING-PONG (ECO DE CONFIRMACAO):
+ DESATIVADO por padrao (PING_PONG_ATIVO = false). O codigo
+ foi mantido para reativacao.
+
+ DETECCAO (v3):
+ O receptor nao mede mais o volume total do microfone. Ele
+ usa um banco de filtros Goertzel (1100 a 3400 Hz, janela de
+ Hann) e so considera "som" a energia de TOM nessa faixa.
+ Ruido de alimentacao, grave de voz, vibracao e ruido de
+ fundo do MAX9814 deixam de contar como bip. Nao precisa
+ acertar a frequencia: o receptor acompanha o tom sozinho
+ (o :C mostra a frequencia que ele esta ouvindo).
+ O protocolo continua baseado so na DURACAO dos bips.
+
+ BIBLIOTECAS: nenhuma alem do core do ESP32 para Arduino.
+
+ HARDWARE (MAX9814 + buzzer passivo):
+ - MAX9814: pino GAIN no VDD (40 dB) para 50 cm a 1 m;
+   A/R sem ligacao; VDD em 3,3 V com 100 uF perto do modulo.
+ - Buzzer passivo no GPIO 15 (pino de strapping: se o boot
+   falhar, mude BUZZER_PIN para 25 ou 26).
+ - Afaste o microfone do buzzer do proprio aparelho.
+=========================================================
+*/
+
+// ======================================================
+// PINOS
+// ======================================================
+
+const int BUZZER_PIN = 15;
+const int MIC_PIN = 32;
+
+// ======================================================
+// BUZZER
+// A frequencia e FIXA e serve apenas para gerar o som.
+// O receptor nao usa a frequencia para nada.
+// Faixa de 1200 a 3400 Hz: e a faixa que o receptor escuta
+// (banco Goertzel) e fica abaixo de Nyquist (5 kHz).
+// ======================================================
+
+const int FREQUENCIA_BUZZER = 2500;   // valor inicial; muda com :F<hz>
+const int FREQUENCIA_MIN = 1200;
+const int FREQUENCIA_MAX = 3400;
+
+// ======================================================
+// DURACOES DOS SINAIS (ms) - AJUSTAVEIS
+// ======================================================
+
+const unsigned long DUR_CONTROLE_MS = 1000;
+const unsigned long DUR_CURTO_MS = 400;
+const unsigned long DUR_LONGO_MS = 600;
+const unsigned long DUR_MODO_NUM_MS = 100;
+const unsigned long DUR_MODO_ESP_MS = 200;
+
+// Silencio entre bips do mesmo caractere.
+const unsigned long INTERVALO_BIPS_MS = 300;
+
+// Silencio apos o ultimo bip de um caractere (qualquer modo).
+// O receptor considera fim de caractere quando o silencio
+// ultrapassa LIMITE_FIM_CARACTERE_MS (valor entre 300 e 900).
+const unsigned long INTERVALO_FIM_CARACTERE_MS = 900;
+const unsigned long LIMITE_FIM_CARACTERE_MS = 600;
+
+// ======================================================
+// LIMITES DE CLASSIFICACAO (ms) - AJUSTAVEIS
+//
+// A duracao medida vai para a classe mais proxima, sem faixas
+// de rejeicao entre as classes.
+//
+//   ate 40          -> descartado no detector (clique)
+//   40  a 60        -> rejeitado (ruido)
+//   60  a 150       -> MODO NUMERICO  (nominal 100)
+//   150 a 300       -> MODO ESPECIAL  (nominal 200)
+//   300 a 500       -> CURTO          (nominal 400)
+//   500 a 800       -> LONGO          (nominal 600)
+//   800 a 1400      -> CONTROLE       (nominal 1000)
+//   acima de 1400   -> rejeitado (ruido continuo)
+//
+// Fora de uma mensagem, um pulso LONGO acima de 700 ms e
+// aceito como controle de inicio (o controle e o ponto
+// unico de falha: se sair curto, a mensagem inteira se perde).
+// ======================================================
+
+const unsigned long LIM_MIN_VALIDO_MS = 60;
+const unsigned long LIM_MODO_NUM_ESP_MS = 150;
+const unsigned long LIM_MODO_ESP_CURTO_MS = 300;
+const unsigned long LIM_CURTO_LONGO_MS = 500;
+const unsigned long LIM_LONGO_CONTROLE_MS = 800;
+const unsigned long LIM_MAX_VALIDO_MS = 1400;
+const unsigned long LIM_CONTROLE_TOLERANTE_MS = 700;
+
+// O receptor mede quanto o bip de controle INICIAL saiu mais
+// longo/curto que 1000 ms e desconta esse desvio dos demais
+// pulsos da mensagem. Desvio maximo: +/- COMPENSACAO_MAX_MS.
+const bool COMPENSAR_COM_CONTROLE = true;
+const long COMPENSACAO_MAX_MS = 150;
+
+// ======================================================
+// DETECCAO DE SOM (energia de tom por Goertzel + tempo)
+// ======================================================
+
+const double SAMPLING_FREQUENCY = 10000.0;
+const uint16_t BLOCO_AMOSTRAS = 64;      // ~6 ms por bloco
+
+const int LIMIAR_AMPLITUDE = 40;         // limiar minimo (amplitude do tom,
+                                         // em contagens do ADC, pico a pico)
+const bool LIMIAR_ADAPTATIVO = true;     // acompanha o ruido ambiente
+const float FATOR_RUIDO = 3.0;           // limiar = ruido * fator + margem
+const int MARGEM_RUIDO = 20;
+const int LIMIAR_MAXIMO = 1500;
+const float RUIDO_ALFA = 0.02;           // velocidade de adaptacao
+const float HISTERESE = 0.6;             // limiar de desligar = ligar * 0.6
+
+const int BLOCOS_CONFIRMA_INICIO = 2;    // blocos seguidos para iniciar
+const unsigned long DEBOUNCE_SILENCIO_MS = 80;  // silencio que encerra o som
+                                                // (junta bips partidos pelo AGC)
+// Fracao do pico usada para medir a duracao do pulso (70%).
+// Valores maiores reduzem o efeito da cauda de reverberacao.
+const float FRACAO_CORTE_PICO = 0.7;
+const unsigned long MIN_PULSO_MS = 40;   // abaixo disso e clique, ignorado
+const unsigned long MAX_PULSO_MS = 1500; // acima disso e ruido continuo
+
+const int AMOSTRAS_RUIDO_INICIAL = 20;   // blocos medidos ao entrar em RECEBER
+
+// Banco de filtros Goertzel. Com 64 amostras a 10 kHz cada
+// "bin" k vale k * 156,25 Hz. Bins vizinhos ficam a 156 Hz
+// um do outro e a janela de Hann espalha cada tom por ~3 bins,
+// entao qualquer frequencia da faixa e vista com perda de no
+// maximo ~1,5 dB (boa tolerancia a buzzer fora de frequencia).
+const int K_MIN_ABS = 7;                 // ~1094 Hz
+const int K_MAX_ABS = 22;                // ~3438 Hz
+const int NUM_BINS_MAX = K_MAX_ABS - K_MIN_ABS + 1;
+const float DC_ALFA = 0.01;              // filtro que remove o nivel DC
+
+// ======================================================
+// PING-PONG
+// ======================================================
+
+// Eco de confirmacao. DESATIVADO por enquanto.
+const bool PING_PONG_ATIVO = false;
+
+const int MAX_TENTATIVAS = 3;
+const unsigned long TIMEOUT_ECO_MS = 2200;        // contado do fim do bip
+const unsigned long GUARDA_POS_EMISSAO_MS = 150;  // microfone ignorado
+const unsigned long ECO_ATRASO_MS = 250;          // espera antes do eco
+
+// ======================================================
+// LIMITES
+// ======================================================
+
+const int MAX_CARACTERES_TX = 100;
+const int MAX_CARACTERES_RX = 200;   // inclui o checksum
+const int MAX_LINHA_SERIAL = 300;
+const unsigned long TIMEOUT_MENSAGEM_MS = 8000;
+
+// Marca de caractere com erro dentro do buffer de recepcao.
+// (0x7F nunca e um caractere valido do protocolo.)
+const char CHAR_ERRO = 0x7F;
+
+// ======================================================
+// TIPOS
+// ======================================================
+
+enum Modo {
+  MENU,
+  EMITIR,
+  RECEBER
+};
+
+enum ModoId {
+  ID_ALFA = 0,
+  ID_NUMERICO = 1,
+  ID_ESPECIAL = 2
+};
+
+enum TipoSinal {
+  SINAL_INVALIDO = -1,
+  SINAL_CONTROLE = 0,
+  SINAL_CURTO,
+  SINAL_LONGO,
+  SINAL_MODO_NUMERICO,
+  SINAL_MODO_ESPECIAL
+};
+
+struct EventoPulso {
+  unsigned long duracao;
+  unsigned long fimMs;
+  int amplitudePico;
+  int binPico;
+};
+
+struct ClasseSinal {
+  TipoSinal tipo;
+  const char *nome;
+  unsigned long nominal;
+};
+
+const ClasseSinal CLASSES_SINAL[] = {
+  { SINAL_CONTROLE,       "CONTROLE",       DUR_CONTROLE_MS },
+  { SINAL_CURTO,          "CURTO",          DUR_CURTO_MS },
+  { SINAL_LONGO,          "LONGO",          DUR_LONGO_MS },
+  { SINAL_MODO_NUMERICO,  "MODO_NUMERICO",  DUR_MODO_NUM_MS },
+  { SINAL_MODO_ESPECIAL,  "MODO_ESPECIAL",  DUR_MODO_ESP_MS }
+};
+
+const int NUM_CLASSES =
+  sizeof(CLASSES_SINAL) / sizeof(CLASSES_SINAL[0]);
+
+// ======================================================
+// TABELAS DE CODIGOS
+// ======================================================
+
+// Morse internacional A-Z. '.' = bip curto, '-' = bip longo.
+const char *const MORSE_LETRAS[26] = {
+  ".-",   "-...", "-.-.", "-..",  ".",    "..-.", "--.",  "....", "..",
+  ".---", "-.-",  ".-..", "--",   "-.",   "---",  ".--.", "--.-", ".-.",
+  "...",  "-",    "..-",  "...-", ".--",  "-..-", "-.--", "--.."
+};
+
+// Tabela numerica propria. '0' = bip curto, '1' = bip longo.
+// Tamanho variavel: o fim do numero e marcado pelo intervalo
+// de fim de caractere.
+const char *const CODIGO_NUMEROS[10] = {
+  "0",   // 0
+  "1",   // 1
+  "00",  // 2
+  "01",  // 3
+  "10",  // 4
+  "11",  // 5
+  "000", // 6
+  "001", // 7
+  "010", // 8
+  "011"  // 9
+};
+
+const int BITS_ESPECIAL = 7;  // ASCII de 7 bits, MSB primeiro
+
+// ======================================================
+// ESTADO GERAL
+// ======================================================
+
+Modo modoAtual = MENU;
+int frequenciaBuzzer = FREQUENCIA_BUZZER;
+String bufferSerial = "";
+
+// ======================================================
+// ESTADO DO DETECTOR DE SOM
+// ======================================================
+
+const unsigned long BLOCO_MS =
+  (unsigned long)((BLOCO_AMOSTRAS * 1000.0) / SAMPLING_FREQUENCY);
+
+const int MAX_BLOCOS_PULSO = 320;
+uint16_t detAmplitudes[MAX_BLOCOS_PULSO];
+unsigned long detTempos[MAX_BLOCOS_PULSO];
+int detNumBlocos = 0;
+
+bool detSomAtivo = false;
+bool detIgnorandoRuido = false;
+int detAltosSeguidos = 0;
+int detAmplitudePico = 0;
+unsigned long detInicioCandidato = 0;
+unsigned long detInicioSom = 0;
+unsigned long detUltimoAlto = 0;
+int detBinPico = K_MIN_ABS;
+
+// Estado do banco Goertzel
+float coefGoertzel[NUM_BINS_MAX];
+float janelaHann[BLOCO_AMOSTRAS];
+int kMin = K_MIN_ABS;          // faixa escutada (muda com :T)
+int kMax = K_MAX_ABS;
+float dcEstimado = 0;
+bool dcInicializado = false;
+int binDominante = K_MIN_ABS;  // bin mais forte do ultimo bloco
+
+float ruidoBase = 0;
+int limiarMinimo = LIMIAR_AMPLITUDE;   // ajustavel em tempo de execucao (:L)
+int limiarOn = LIMIAR_AMPLITUDE;
+int limiarOff = (int)(LIMIAR_AMPLITUDE * HISTERESE);
+
+// ======================================================
+// ESTADO DO RECEPTOR
+// ======================================================
+
+bool recebendoMensagem = false;
+ModoId modoIdRx = ID_ALFA;   // modo do caractere em andamento
+long offsetRx = 0;           // desvio medido no controle inicial (ms)
+String simbolosRx = "";      // simbolos do caractere em andamento
+bool descartandoRx = false;  // caractere com simbolos demais
+String charsRx = "";         // caracteres decodificados (CHAR_ERRO = erro)
+int errosRx = 0;             // erros na mensagem atual
+unsigned long ultimaAtividadeRx = 0;
+
+// Calibracao (comandos :C e :L no modo receptor)
+bool calibrando = false;
+unsigned long calibInicioJanela = 0;
+int calibMaxJanela = 0;
+long calibSomaJanela = 0;
+int calibBlocosJanela = 0;
+int calibMaxTotal = 0;
+int calibBinJanela = K_MIN_ABS;
+
+// ======================================================
+// ESTATISTICAS
+// ======================================================
+
+unsigned long totalSinaisEnviados = 0;
+unsigned long totalSinaisConfirmados = 0;
+unsigned long totalRetransmissoes = 0;
+unsigned long totalFalhas = 0;
+unsigned long somaTempoConfirmacao = 0;
+
+// Zerados a cada mensagem recebida.
+unsigned long totalPulsosValidos = 0;
+unsigned long totalPulsosInvalidos = 0;
+unsigned long totalRuidosFiltrados = 0;
+unsigned long totalRuidosContinuos = 0;
+
+unsigned long totalMensagensRecebidas = 0;
+unsigned long totalErrosCaractere = 0;
+
+// ======================================================
+// PROTOTIPOS
+// ======================================================
+
+bool lerLinhaSerial(String &linha);
+bool comandoEh(String entrada, String comando);
+bool soDigitos(const String &s, int inicio);
+void definirModo(Modo novoModo);
+bool verificarComandoTroca();
+bool aguardarMs(unsigned long ms);
+bool tocarBip(unsigned long ms);
+
+const char *nomeDoSinal(TipoSinal tipo);
+unsigned long duracaoDoSinal(TipoSinal tipo);
+TipoSinal classificarDuracao(unsigned long duracao);
+const char *nomeDoModoId(ModoId modo);
+ModoId modoDoCaractere(char c);
+
+char removerAcento(uint8_t segundoByte);
+String normalizarTexto(const String &entrada, int &ignorados);
+char calcularChecksum(const String &texto);
+String bitsDoCaractere(char c);
+String montarPlano(const String &texto, bool detalhar);
+TipoSinal tipoDoSimboloPlano(char c);
+bool enviarSinalConfirmado(TipoSinal tipo);
+bool enviarPlano(const String &plano);
+void transmitirTexto(String entrada);
+void imprimirEstatisticasEmissao();
+void testarFrequencia(int hz);
+
+int lerAmplitudeBloco();
+void inicializarGoertzel();
+int freqDoBin(int bin);
+void atualizarLimiares();
+void atualizarRuido(int amplitude);
+void semearRuido();
+void detectorReiniciar();
+void gravarBloco(int amplitude, unsigned long tempo);
+bool medirPulsoNoCorte(unsigned long &inicio, unsigned long &fim);
+bool detectorProcessar(EventoPulso &ev);
+
+char simboloChar(TipoSinal tipo, ModoId modo);
+char decodificarMorse(const String &simbolos);
+char decodificarNumero(const String &simbolos);
+char decodificarEspecial(const String &bits);
+String montarTextoRx(const String &chars);
+void resetarRecepcao();
+void adicionarErroCaractere(const char *motivo);
+void finalizarCaractere();
+void acumularSimbolo(char simbolo);
+void iniciarMensagemRx();
+void finalizarMensagemRx();
+bool processarPulso(const EventoPulso &ev, TipoSinal &tipoAceito);
+bool emitirEco(TipoSinal tipo);
+void verificarTemposReceptor();
+bool tratarComandoCalibracao(const String &comando);
+void executarCalibracao();
+void executarReceptor();
+
+// ======================================================
+// LEITURA DO SERIAL (NAO BLOQUEANTE)
+// Acumula bytes ate chegar '\n'. Nunca espera: nao
+// distorce a duracao dos bips durante a emissao.
+// Retorna true quando uma linha completa foi lida.
+// ======================================================
+
+bool lerLinhaSerial(String &linha) {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+
+    if (c == '\r') {
+      continue;
+    }
+
+    if (c == '\n') {
+      linha = bufferSerial;
+      bufferSerial = "";
+      linha.trim();
+      return true;
+    }
+
+    if (bufferSerial.length() < MAX_LINHA_SERIAL) {
+      bufferSerial += c;
+    }
+  }
+
+  return false;
+}
+
+// ======================================================
+// COMPARACAO DE COMANDOS
+// ======================================================
+
+bool comandoEh(String entrada, String comando) {
+  entrada.trim();
+  entrada.toUpperCase();
+  comando.toUpperCase();
+
+  return entrada == comando;
+}
+
+// true se a partir de 'inicio' ha ao menos 1 caractere e
+// todos sao digitos.
+bool soDigitos(const String &s, int inicio) {
+  if ((int)s.length() <= inicio) {
+    return false;
+  }
+
+  for (int i = inicio; i < (int)s.length(); i++) {
+    if (s[i] < '0' || s[i] > '9') {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ======================================================
+// TROCA DE MODO DO APARELHO (menu / emitir / receber)
+// ======================================================
+
+void definirModo(Modo novoModo) {
+  noTone(BUZZER_PIN);
+
+  modoAtual = novoModo;
+
+  resetarRecepcao();
+  detectorReiniciar();
+  calibrando = false;
+
+  Serial.println();
+  Serial.println("======================================");
+
+  if (modoAtual == EMITIR) {
+    Serial.println("MODO EMITIR ATIVADO");
+    Serial.println("Digite um texto para transmitir.");
+    Serial.println("Digite :R + ENTER para receber.");
+    Serial.println("Digite :F<hz> para testar o buzzer (ex.: :F3000).");
+  }
+  else if (modoAtual == RECEBER) {
+    Serial.println("MODO RECEBER ATIVADO");
+    Serial.println("Aguardando sinal acustico...");
+    Serial.println("Digite :E + ENTER para emitir.");
+    Serial.println("Digite :C + ENTER para calibrar o microfone.");
+    Serial.println("Digite :L<valor> para ajustar o limiar (ex.: :L150).");
+    Serial.println("Digite :T<hz> para travar a escuta num tom (:T0 = automatico).");
+  }
+
+  Serial.println("======================================");
+  Serial.println();
+
+  if (modoAtual == RECEBER) {
+    semearRuido();
+  }
+}
+
+// ======================================================
+// COMANDO DE TROCA DURANTE UMA OPERACAO EM ANDAMENTO
+// Retorna true se o modo do aparelho foi alterado.
+// ======================================================
+
+bool verificarComandoTroca() {
+  String comando;
+
+  if (!lerLinhaSerial(comando)) {
+    return false;
+  }
+
+  if (modoAtual == EMITIR &&
+      (comandoEh(comando, ":R") ||
+       comandoEh(comando, ":RECEBER"))) {
+    definirModo(RECEBER);
+    return true;
+  }
+
+  if (modoAtual == RECEBER &&
+      (comandoEh(comando, ":E") ||
+       comandoEh(comando, ":EMITIR"))) {
+    definirModo(EMITIR);
+    return true;
+  }
+
+  if (comando.length() > 0) {
+    Serial.println(
+      "(entrada ignorada: operacao em andamento)"
+    );
+  }
+
+  return false;
+}
+
+// ======================================================
+// ESPERA NAO TRAVADA (interrompivel por :R / :E)
+// Retorna false se o modo mudou durante a espera.
+// ======================================================
+
+bool aguardarMs(unsigned long ms) {
+  Modo modoInicial = modoAtual;
+  unsigned long inicio = millis();
+
+  while (millis() - inicio < ms) {
+    if (verificarComandoTroca()) {
+      return false;
+    }
+
+    if (modoAtual != modoInicial) {
+      return false;
+    }
+
+    delay(1);
+  }
+
+  return modoAtual == modoInicial;
+}
+
+// ======================================================
+// EMITE UM BIP COM A DURACAO INDICADA
+// ======================================================
+
+bool tocarBip(unsigned long ms) {
+  tone(BUZZER_PIN, frequenciaBuzzer);
+
+  bool ok = aguardarMs(ms);
+
+  noTone(BUZZER_PIN);
+
+  return ok;
+}
+
+// ======================================================
+// TIPOS DE SINAL
+// ======================================================
+
+const char *nomeDoSinal(TipoSinal tipo) {
+  for (int i = 0; i < NUM_CLASSES; i++) {
+    if (CLASSES_SINAL[i].tipo == tipo) {
+      return CLASSES_SINAL[i].nome;
+    }
+  }
+
+  return "INVALIDO";
+}
+
+unsigned long duracaoDoSinal(TipoSinal tipo) {
+  for (int i = 0; i < NUM_CLASSES; i++) {
+    if (CLASSES_SINAL[i].tipo == tipo) {
+      return CLASSES_SINAL[i].nominal;
+    }
+  }
+
+  return 0;
+}
+
+// Classifica a duracao medida pela classe mais proxima.
+// Fora de [LIM_MIN_VALIDO_MS, LIM_MAX_VALIDO_MS] = invalido.
+TipoSinal classificarDuracao(unsigned long duracao) {
+  if (duracao < LIM_MIN_VALIDO_MS ||
+      duracao > LIM_MAX_VALIDO_MS) {
+    return SINAL_INVALIDO;
+  }
+
+  if (duracao <= LIM_MODO_NUM_ESP_MS) return SINAL_MODO_NUMERICO;
+  if (duracao <= LIM_MODO_ESP_CURTO_MS) return SINAL_MODO_ESPECIAL;
+  if (duracao <= LIM_CURTO_LONGO_MS) return SINAL_CURTO;
+  if (duracao <= LIM_LONGO_CONTROLE_MS) return SINAL_LONGO;
+
+  return SINAL_CONTROLE;
+}
+
+const char *nomeDoModoId(ModoId modo) {
+  if (modo == ID_ALFA) return "ALFA";
+  if (modo == ID_NUMERICO) return "NUMERICO";
+  return "ESPECIAL";
+}
+
+// ======================================================
+// MODO DE IDENTIFICACAO ADEQUADO A CADA CARACTERE
+// ======================================================
+
+ModoId modoDoCaractere(char c) {
+  if (c >= 'A' && c <= 'Z') return ID_ALFA;
+  if (c >= '0' && c <= '9') return ID_NUMERICO;
+  return ID_ESPECIAL;
+}
+
+// ======================================================
+// NORMALIZACAO DO TEXTO
+// - minusculas viram maiusculas (Morse nao tem caixa)
+// - acentos comuns do portugues (UTF-8) perdem o acento
+// - caracteres fora de ASCII 0x20-0x7E sao ignorados
+// - caractere multibyte sem equivalente conta como 1 ignorado
+// ======================================================
+
+char removerAcento(uint8_t s) {
+  if (s >= 0x80 && s <= 0x85) return 'A';
+  if (s == 0x87) return 'C';
+  if (s >= 0x88 && s <= 0x8B) return 'E';
+  if (s >= 0x8C && s <= 0x8F) return 'I';
+  if (s == 0x91) return 'N';
+  if (s >= 0x92 && s <= 0x96) return 'O';
+  if (s >= 0x99 && s <= 0x9C) return 'U';
+
+  if (s >= 0xA0 && s <= 0xA5) return 'A';
+  if (s == 0xA7) return 'C';
+  if (s >= 0xA8 && s <= 0xAB) return 'E';
+  if (s >= 0xAC && s <= 0xAF) return 'I';
+  if (s == 0xB1) return 'N';
+  if (s >= 0xB2 && s <= 0xB6) return 'O';
+  if (s >= 0xB9 && s <= 0xBC) return 'U';
+
+  return 0;
+}
+
+String normalizarTexto(const String &entrada, int &ignorados) {
+  String saida = "";
+  ignorados = 0;
+
+  int n = entrada.length();
+
+  for (int i = 0; i < n; i++) {
+    uint8_t b = (uint8_t)entrada[i];
+
+    if (b == 0xC3 && i + 1 < n) {
+      uint8_t segundo = (uint8_t)entrada[i + 1];
+      i++;
+
+      char base = removerAcento(segundo);
+
+      if (base != 0) {
+        saida += base;
+      }
+      else {
+        ignorados++;
+      }
+
+      continue;
+    }
+
+    if (b >= 0x80) {
+      // Byte de continuacao UTF-8 (10xxxxxx) nao conta de novo:
+      // so o byte inicial representa o caractere ignorado.
+      if ((b & 0xC0) != 0x80) {
+        ignorados++;
+      }
+
+      continue;
+    }
+
+    if (b >= 'a' && b <= 'z') {
+      b = b - 'a' + 'A';
+    }
+
+    if (b >= 0x20 && b <= 0x7E) {
+      saida += (char)b;
+    }
+    else if (b != '\r' && b != '\n') {
+      ignorados++;
+    }
+  }
+
+  return saida;
+}
+
+// ======================================================
+// CHECKSUM
+// Soma ponderada pela posicao (detecta troca de ordem e
+// caractere perdido). Resultado sempre em 0x20-0x7E, para
+// poder ser enviado como caractere ESPECIAL.
+// ======================================================
+
+char calcularChecksum(const String &texto) {
+  uint32_t soma = 0;
+  int n = texto.length();
+
+  for (int i = 0; i < n; i++) {
+    soma += (uint32_t)(uint8_t)texto[i] * (uint32_t)(i + 1);
+  }
+
+  return (char)(0x20 + (soma % 95));
+}
+
+String bitsDoCaractere(char c) {
+  String bits = "";
+
+  for (int b = BITS_ESPECIAL - 1; b >= 0; b--) {
+    bits += ((((uint8_t)c) >> b) & 1) ? '1' : '0';
+  }
+
+  return bits;
+}
+
+// ======================================================
+// PLANO DE TRANSMISSAO
+//
+// Texto -> sequencia de simbolos:
+//   C = bip de controle (inicio/fim)
+//   N = modo numerico para o proximo caractere (100 ms)
+//   S = modo especial para o proximo caractere (200 ms)
+//   0 = bip curto
+//   1 = bip longo
+//   | = fim de caractere (intervalo longo apos o bip anterior)
+//
+// Letras (modo ALFA) nao levam sinal de modo.
+// Todo caractere termina em '|', inclusive os especiais.
+// O ultimo caractere antes do controle final e o checksum.
+// ======================================================
+
+String montarPlano(const String &texto, bool detalhar) {
+  String plano = "C";
+
+  int n = texto.length();
+
+  for (int i = 0; i < n; i++) {
+    char c = texto[i];
+    ModoId modo = modoDoCaractere(c);
+
+    if (modo == ID_NUMERICO) {
+      plano += 'N';
+    }
+    else if (modo == ID_ESPECIAL) {
+      plano += 'S';
+    }
+
+    String codigo = "";
+
+    if (modo == ID_ALFA) {
+      const char *morse = MORSE_LETRAS[c - 'A'];
+
+      for (int k = 0; morse[k] != 0; k++) {
+        plano += (morse[k] == '.') ? '0' : '1';
+      }
+
+      codigo = morse;
+    }
+    else if (modo == ID_NUMERICO) {
+      const char *num = CODIGO_NUMEROS[c - '0'];
+
+      plano += num;
+      codigo = num;
+    }
+    else {
+      codigo = bitsDoCaractere(c);
+      plano += codigo;
+    }
+
+    plano += '|';
+
+    if (detalhar) {
+      Serial.print("'");
+      Serial.print(c);
+      Serial.print("' -> modo ");
+      Serial.print(nomeDoModoId(modo));
+      Serial.print(": ");
+      Serial.println(codigo);
+    }
+  }
+
+  char cs = calcularChecksum(texto);
+
+  plano += 'S';
+  plano += bitsDoCaractere(cs);
+  plano += '|';
+
+  if (detalhar) {
+    Serial.print("checksum '");
+    Serial.print(cs);
+    Serial.print("' -> modo ESPECIAL: ");
+    Serial.println(bitsDoCaractere(cs));
+  }
+
+  plano += 'C';
+
+  return plano;
+}
+
+TipoSinal tipoDoSimboloPlano(char c) {
+  if (c == 'C') return SINAL_CONTROLE;
+  if (c == 'N') return SINAL_MODO_NUMERICO;
+  if (c == 'S') return SINAL_MODO_ESPECIAL;
+  if (c == '0') return SINAL_CURTO;
+  if (c == '1') return SINAL_LONGO;
+
+  return SINAL_INVALIDO;
+}
+
+// ======================================================
+// ENVIO DE UM SINAL (com ou sem ping-pong)
+// ======================================================
+
+bool enviarSinalConfirmado(TipoSinal tipo) {
+  unsigned long duracao = duracaoDoSinal(tipo);
+
+  // Sem ping-pong: apenas emite o bip, sem esperar confirmacao.
+  if (!PING_PONG_ATIVO) {
+    if (modoAtual != EMITIR) {
+      return false;
+    }
+
+    totalSinaisEnviados++;
+
+    Serial.print("TX: ");
+    Serial.print(nomeDoSinal(tipo));
+    Serial.print(" (");
+    Serial.print(duracao);
+    Serial.println(" ms)");
+
+    return tocarBip(duracao);
+  }
+
+  for (int tentativa = 1;
+       tentativa <= MAX_TENTATIVAS;
+       tentativa++) {
+
+    if (modoAtual != EMITIR) {
+      return false;
+    }
+
+    totalSinaisEnviados++;
+
+    Serial.print("PING: ");
+    Serial.print(nomeDoSinal(tipo));
+    Serial.print(" (");
+    Serial.print(duracao);
+    Serial.print(" ms, tentativa ");
+    Serial.print(tentativa);
+    Serial.println(")...");
+
+    unsigned long inicioEnvio = millis();
+
+    if (!tocarBip(duracao)) {
+      return false;
+    }
+
+    unsigned long fimEnvio = millis();
+
+    if (!aguardarMs(GUARDA_POS_EMISSAO_MS)) {
+      return false;
+    }
+
+    detectorReiniciar();
+
+    bool confirmou = false;
+    unsigned long tempoRTT = 0;
+
+    while (millis() - fimEnvio < TIMEOUT_ECO_MS) {
+      if (verificarComandoTroca()) {
+        return false;
+      }
+
+      if (modoAtual != EMITIR) {
+        return false;
+      }
+
+      EventoPulso ev;
+
+      if (detectorProcessar(ev)) {
+        TipoSinal recebido = classificarDuracao(ev.duracao);
+
+        if (recebido == tipo) {
+          confirmou = true;
+          tempoRTT = millis() - inicioEnvio;
+          break;
+        }
+
+        Serial.print("Sinal ignorado na espera do eco: ");
+        Serial.print(ev.duracao);
+        Serial.println(" ms (nao corresponde).");
+      }
+    }
+
+    if (confirmou) {
+      totalSinaisConfirmados++;
+      somaTempoConfirmacao += tempoRTT;
+
+      Serial.print("PONG: eco confirmado em ");
+      Serial.print(tempoRTT);
+      Serial.println(" ms.");
+
+      return true;
+    }
+
+    if (tentativa < MAX_TENTATIVAS) {
+      totalRetransmissoes++;
+
+      Serial.println(
+        "Sem eco correspondente. Reenviando o mesmo sinal..."
+      );
+
+      if (!aguardarMs(150)) {
+        return false;
+      }
+    }
+  }
+
+  totalFalhas++;
+
+  Serial.print("FALHA: nao houve eco de ");
+  Serial.print(nomeDoSinal(tipo));
+  Serial.println(
+    ". Transmissao interrompida para evitar "
+    "continuar sem confirmacao."
+  );
+
+  return false;
+}
+
+// ======================================================
+// ENVIO DO PLANO COMPLETO
+// ======================================================
+
+bool enviarPlano(const String &plano) {
+  int n = plano.length();
+
+  for (int i = 0; i < n; i++) {
+    char c = plano[i];
+
+    if (c == '|') {
+      continue;
+    }
+
+    if (modoAtual != EMITIR) {
+      return false;
+    }
+
+    TipoSinal tipo = tipoDoSimboloPlano(c);
+
+    if (!enviarSinalConfirmado(tipo)) {
+      return false;
+    }
+
+    if (i == n - 1) {
+      break;
+    }
+
+    // Se o proximo simbolo do plano e '|', o caractere
+    // terminou: usa o intervalo longo de fim de caractere.
+    unsigned long intervalo =
+      (plano[i + 1] == '|')
+        ? INTERVALO_FIM_CARACTERE_MS
+        : INTERVALO_BIPS_MS;
+
+    if (!aguardarMs(intervalo)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ======================================================
+// TRANSMISSOR DE TEXTO
+// ======================================================
+
+void transmitirTexto(String entrada) {
+  if (entrada.length() == 0) {
+    return;
+  }
+
+  int ignorados = 0;
+  String texto = normalizarTexto(entrada, ignorados);
+
+  Serial.println();
+  Serial.print("Texto: ");
+  Serial.println(entrada);
+
+  Serial.print("Texto normalizado: ");
+  Serial.println(texto);
+
+  if (ignorados > 0) {
+    Serial.print("AVISO: ");
+    Serial.print(ignorados);
+    Serial.println(
+      " caractere(s) sem representacao no protocolo "
+      "foram ignorados."
+    );
+  }
+
+  if (texto.length() == 0) {
+    Serial.println("Nada para transmitir.");
+    return;
+  }
+
+  if (texto.length() > MAX_CARACTERES_TX) {
+    Serial.print("ERRO: texto maior que ");
+    Serial.print(MAX_CARACTERES_TX);
+    Serial.println(" caracteres.");
+    return;
+  }
+
+  String plano = montarPlano(texto, true);
+
+  Serial.print("Plano de bips: ");
+  Serial.println(plano);
+  Serial.println(
+    "(C=controle N=modo numerico S=modo especial "
+    "0=curto 1=longo |=fim de caractere)"
+  );
+
+  Serial.println("Iniciando transmissao...");
+
+  if (!enviarPlano(plano)) {
+    if (modoAtual == EMITIR) {
+      Serial.println("Transmissao interrompida.");
+    }
+
+    return;
+  }
+
+  Serial.println("Transmissao finalizada.");
+  imprimirEstatisticasEmissao();
+  Serial.println("Digite outro texto ou :R para receber.");
+}
+
+// Ajusta a frequencia do buzzer e toca 2 s para teste. Use
+// junto com :C no receptor para achar a frequencia que chega
+// mais forte no microfone.
+void testarFrequencia(int hz) {
+  if (hz < FREQUENCIA_MIN || hz > FREQUENCIA_MAX) {
+    Serial.print("Frequencia invalida. Use de ");
+    Serial.print(FREQUENCIA_MIN);
+    Serial.print(" a ");
+    Serial.print(FREQUENCIA_MAX);
+    Serial.println(" Hz.");
+    return;
+  }
+
+  frequenciaBuzzer = hz;
+
+  Serial.print("Frequencia do buzzer: ");
+  Serial.print(frequenciaBuzzer);
+  Serial.println(" Hz. Tocando 2 s...");
+
+  tocarBip(2000);
+}
+
+void imprimirEstatisticasEmissao() {
+  Serial.println("===== ESTATISTICAS DE EMISSAO =====");
+
+  Serial.print("Sinais enviados: ");
+  Serial.println(totalSinaisEnviados);
+
+  if (!PING_PONG_ATIVO) {
+    Serial.println("Ping-pong (eco) desativado.");
+    return;
+  }
+
+  Serial.print("Sinais confirmados: ");
+  Serial.println(totalSinaisConfirmados);
+
+  Serial.print("Retransmissoes: ");
+  Serial.println(totalRetransmissoes);
+
+  Serial.print("Falhas: ");
+  Serial.println(totalFalhas);
+
+  if (totalSinaisConfirmados > 0) {
+    Serial.print("Tempo medio de confirmacao: ");
+    Serial.print(somaTempoConfirmacao / totalSinaisConfirmados);
+    Serial.println(" ms");
+  }
+}
+
+// ======================================================
+// DETECTOR DE SOM
+//
+// Le blocos de amostras e calcula a energia de TOM (Goertzel
+// com janela de Hann) em cada bin da faixa escutada. A
+// amplitude do bloco e a do bin mais forte, convertida para
+// "pico a pico equivalente" (mesma escala do limiar). Decide
+// entre som e silencio com histerese e mede a duracao de
+// cada pulso. A frequencia so serve para separar tom de ruido.
+// ======================================================
+
+void inicializarGoertzel() {
+  for (int i = 0; i < BLOCO_AMOSTRAS; i++) {
+    janelaHann[i] =
+      0.5f * (1.0f - cosf(2.0f * PI * i / BLOCO_AMOSTRAS));
+  }
+
+  for (int b = 0; b < NUM_BINS_MAX; b++) {
+    coefGoertzel[b] =
+      2.0f * cosf(2.0f * PI * (K_MIN_ABS + b) / BLOCO_AMOSTRAS);
+  }
+}
+
+int freqDoBin(int bin) {
+  return (int)(bin * SAMPLING_FREQUENCY / BLOCO_AMOSTRAS + 0.5);
+}
+
+int lerAmplitudeBloco() {
+  const unsigned long periodo =
+    (unsigned long)(1000000.0 / SAMPLING_FREQUENCY);
+
+  const int offset = kMin - K_MIN_ABS;
+  const int nBins = kMax - kMin + 1;
+
+  float s1[NUM_BINS_MAX];
+  float s2[NUM_BINS_MAX];
+
+  for (int b = 0; b < nBins; b++) {
+    s1[b] = 0;
+    s2[b] = 0;
+  }
+
+  unsigned long proximo = micros();
+
+  for (uint16_t i = 0; i < BLOCO_AMOSTRAS; i++) {
+    // Amostragem em instantes absolutos (sem acumular erro).
+    while ((long)(micros() - proximo) < 0) {
+      // espera o instante da amostra
+    }
+
+    proximo += periodo;
+
+    int valor = analogRead(MIC_PIN);
+
+    // Remove o nivel DC (o MAX9814 fica em ~1,25 V).
+    if (!dcInicializado) {
+      dcEstimado = (float)valor;
+      dcInicializado = true;
+    }
+
+    dcEstimado += DC_ALFA * ((float)valor - dcEstimado);
+
+    float x = ((float)valor - dcEstimado) * janelaHann[i];
+
+    for (int b = 0; b < nBins; b++) {
+      float s0 = coefGoertzel[offset + b] * s1[b] - s2[b] + x;
+      s2[b] = s1[b];
+      s1[b] = s0;
+    }
+  }
+
+  float melhor = 0;
+  int melhorBin = kMin;
+
+  for (int b = 0; b < nBins; b++) {
+    float p = s1[b] * s1[b] + s2[b] * s2[b]
+              - coefGoertzel[offset + b] * s1[b] * s2[b];
+
+    if (p < 0) {
+      p = 0;
+    }
+
+    if (p > melhor) {
+      melhor = p;
+      melhorBin = kMin + b;
+    }
+  }
+
+  binDominante = melhorBin;
+
+  // Com janela de Hann: amplitude do tom A = 4*|X|/N, e o
+  // pico a pico equivalente e 2*A = 8*|X|/N.
+  float amplitude = 8.0f * sqrtf(melhor) / BLOCO_AMOSTRAS;
+
+  if (amplitude > 4095.0f) {
+    amplitude = 4095.0f;
+  }
+
+  return (int)amplitude;
+}
+
+void atualizarLimiares() {
+  int ligar = limiarMinimo;
+
+  if (LIMIAR_ADAPTATIVO) {
+    int adaptado =
+      (int)(ruidoBase * FATOR_RUIDO) + MARGEM_RUIDO;
+
+    if (adaptado > ligar) {
+      ligar = adaptado;
+    }
+  }
+
+  if (ligar > LIMIAR_MAXIMO) {
+    ligar = LIMIAR_MAXIMO;
+  }
+
+  limiarOn = ligar;
+  limiarOff = (int)(ligar * HISTERESE);
+}
+
+void atualizarRuido(int amplitude) {
+  if (!LIMIAR_ADAPTATIVO) {
+    return;
+  }
+
+  ruidoBase += RUIDO_ALFA * ((float)amplitude - ruidoBase);
+
+  atualizarLimiares();
+}
+
+// Mede o ruido ambiente ao entrar em RECEBER, para o limiar
+// ja comecar adequado ao local (o MAX9814 tem ruido proprio).
+void semearRuido() {
+  if (!LIMIAR_ADAPTATIVO) {
+    return;
+  }
+
+  long soma = 0;
+
+  for (int i = 0; i < AMOSTRAS_RUIDO_INICIAL; i++) {
+    soma += lerAmplitudeBloco();
+  }
+
+  ruidoBase = (float)soma / AMOSTRAS_RUIDO_INICIAL;
+  atualizarLimiares();
+
+  Serial.print("Ruido ambiente medido: ");
+  Serial.print(ruidoBase, 1);
+  Serial.print(" | limiar liga ");
+  Serial.print(limiarOn);
+  Serial.print(", desliga ");
+  Serial.println(limiarOff);
+}
+
+void detectorReiniciar() {
+  detSomAtivo = false;
+  detIgnorandoRuido = false;
+  detAltosSeguidos = 0;
+  detAmplitudePico = 0;
+  detNumBlocos = 0;
+}
+
+void gravarBloco(int amplitude, unsigned long tempo) {
+  if (detNumBlocos < MAX_BLOCOS_PULSO) {
+    detAmplitudes[detNumBlocos] = (uint16_t)amplitude;
+    detTempos[detNumBlocos] = tempo;
+    detNumBlocos++;
+  }
+}
+
+// Mede o pulso a FRACAO_CORTE_PICO (70%) do pico.
+// Envelope suavizado (media de 3 blocos); o inicio e o fim sao
+// os instantes em que o envelope cruza o corte (nunca abaixo
+// do limiar de desligar). Assim, volume fraco, cauda de
+// reverberacao e subida lenta do AGC distorcem menos a duracao.
+bool medirPulsoNoCorte(unsigned long &inicio, unsigned long &fim) {
+  static int envelope[MAX_BLOCOS_PULSO];
+
+  int n = detNumBlocos;
+
+  if (n < 2) {
+    return false;
+  }
+
+  int picoEnvelope = 0;
+
+  for (int i = 0; i < n; i++) {
+    int soma = detAmplitudes[i];
+    int cont = 1;
+
+    if (i > 0) {
+      soma += detAmplitudes[i - 1];
+      cont++;
+    }
+
+    if (i < n - 1) {
+      soma += detAmplitudes[i + 1];
+      cont++;
+    }
+
+    envelope[i] = soma / cont;
+
+    if (envelope[i] > picoEnvelope) {
+      picoEnvelope = envelope[i];
+    }
+  }
+
+  int corte = (int)(picoEnvelope * FRACAO_CORTE_PICO);
+
+  if (corte < limiarOff) {
+    corte = limiarOff;
+  }
+
+  for (int tentativa = 0; tentativa < 2; tentativa++) {
+    int primeiro = -1;
+    int ultimo = -1;
+
+    for (int i = 0; i < n; i++) {
+      if (envelope[i] >= corte) {
+        if (primeiro < 0) {
+          primeiro = i;
+        }
+
+        ultimo = i;
+      }
+    }
+
+    if (primeiro >= 0) {
+      inicio = detTempos[primeiro] - BLOCO_MS;
+      fim = detTempos[ultimo];
+      return true;
+    }
+
+    // Pulso fraco: o envelope suavizado nao chegou ao limiar.
+    corte = (int)(picoEnvelope * FRACAO_CORTE_PICO);
+  }
+
+  return false;
+}
+
+// Processa UM bloco de amostras (~6 ms).
+// Retorna true quando um pulso terminou (ev preenchido) ou
+// quando um som excedeu a duracao maxima (ruido continuo).
+bool detectorProcessar(EventoPulso &ev) {
+  int amplitude = lerAmplitudeBloco();
+  unsigned long agora = millis();
+
+  bool alto = detSomAtivo
+    ? (amplitude >= limiarOff)
+    : (amplitude >= limiarOn);
+
+  // ---- Silencio: procura o inicio de um som ----
+  if (!detSomAtivo) {
+    if (alto) {
+      if (detAltosSeguidos == 0) {
+        detInicioCandidato = agora - BLOCO_MS;
+        detNumBlocos = 0;
+      }
+
+      gravarBloco(amplitude, agora);
+
+      detAltosSeguidos++;
+
+      if (detAltosSeguidos >= BLOCOS_CONFIRMA_INICIO) {
+        detSomAtivo = true;
+        detIgnorandoRuido = false;
+        detInicioSom = detInicioCandidato;
+        detUltimoAlto = agora;
+        detAmplitudePico = amplitude;
+        detBinPico = binDominante;
+      }
+    }
+    else {
+      detAltosSeguidos = 0;
+      detNumBlocos = 0;
+      atualizarRuido(amplitude);
+    }
+
+    return false;
+  }
+
+  // ---- Som ativo ----
+  if (!detIgnorandoRuido) {
+    gravarBloco(amplitude, agora);
+  }
+
+  if (alto) {
+    detUltimoAlto = agora;
+
+    if (amplitude > detAmplitudePico) {
+      detAmplitudePico = amplitude;
+      detBinPico = binDominante;
+    }
+
+    if (detIgnorandoRuido) {
+      // Ruido continuo: o limiar sobe ate o ruido virar "silencio".
+      atualizarRuido(amplitude);
+      return false;
+    }
+
+    if (agora - detInicioSom > MAX_PULSO_MS) {
+      detIgnorandoRuido = true;
+      totalRuidosContinuos++;
+
+      ev.duracao = agora - detInicioSom;
+      ev.fimMs = agora;
+      ev.amplitudePico = detAmplitudePico;
+      ev.binPico = detBinPico;
+
+      return true;
+    }
+
+    return false;
+  }
+
+  // Bloco abaixo do limiar durante um som.
+  if (detIgnorandoRuido) {
+    atualizarRuido(amplitude);
+  }
+
+  // O som so termina apos um silencio minimo; pequenas
+  // falhas dentro do mesmo bip sao absorvidas.
+  if (agora - detUltimoAlto >= DEBOUNCE_SILENCIO_MS) {
+    detSomAtivo = false;
+    detAltosSeguidos = 0;
+
+    if (detIgnorandoRuido) {
+      detIgnorandoRuido = false;
+      return false;
+    }
+
+    unsigned long inicioMedido = 0;
+    unsigned long fimMedido = 0;
+
+    if (!medirPulsoNoCorte(inicioMedido, fimMedido)) {
+      totalRuidosFiltrados++;
+      return false;
+    }
+
+    unsigned long duracao = fimMedido - inicioMedido;
+
+    if (duracao < MIN_PULSO_MS) {
+      totalRuidosFiltrados++;
+      return false;
+    }
+
+    ev.duracao = duracao;
+    ev.fimMs = fimMedido;
+    ev.amplitudePico = detAmplitudePico;
+    ev.binPico = detBinPico;
+
+    return true;
+  }
+
+  return false;
+}
+
+// ======================================================
+// DECODIFICACAO
+// ======================================================
+
+// Simbolo acumulado: Morse usa '.' e '-'; os demais modos
+// usam '0' e '1'.
+char simboloChar(TipoSinal tipo, ModoId modo) {
+  if (modo == ID_ALFA) {
+    return (tipo == SINAL_CURTO) ? '.' : '-';
+  }
+
+  return (tipo == SINAL_CURTO) ? '0' : '1';
+}
+
+char decodificarMorse(const String &simbolos) {
+  for (int i = 0; i < 26; i++) {
+    if (simbolos == MORSE_LETRAS[i]) {
+      return (char)('A' + i);
+    }
+  }
+
+  return 0;
+}
+
+char decodificarNumero(const String &simbolos) {
+  for (int i = 0; i < 10; i++) {
+    if (simbolos == CODIGO_NUMEROS[i]) {
+      return (char)('0' + i);
+    }
+  }
+
+  return 0;
+}
+
+char decodificarEspecial(const String &bits) {
+  if (bits.length() != BITS_ESPECIAL) {
+    return 0;
+  }
+
+  int valor = 0;
+
+  for (int i = 0; i < BITS_ESPECIAL; i++) {
+    if (bits[i] != '0' && bits[i] != '1') {
+      return 0;   // simbolo desconhecido ('?')
+    }
+
+    valor = (valor << 1) | (bits[i] == '1' ? 1 : 0);
+  }
+
+  if (valor >= 0x20 && valor <= 0x7E) {
+    return (char)valor;
+  }
+
+  return 0;
+}
+
+// Converte o buffer de caracteres em texto legivel.
+String montarTextoRx(const String &chars) {
+  String texto = "";
+
+  for (int i = 0; i < (int)chars.length(); i++) {
+    if (chars[i] == CHAR_ERRO) {
+      texto += "[?]";
+    }
+    else {
+      texto += chars[i];
+    }
+  }
+
+  return texto;
+}
+
+// ======================================================
+// ESTADO DA RECEPCAO
+// ======================================================
+
+void resetarRecepcao() {
+  recebendoMensagem = false;
+  modoIdRx = ID_ALFA;
+  offsetRx = 0;
+  simbolosRx = "";
+  descartandoRx = false;
+  charsRx = "";
+  errosRx = 0;
+}
+
+void adicionarErroCaractere(const char *motivo) {
+  errosRx++;
+  totalErrosCaractere++;
+
+  charsRx += CHAR_ERRO;
+
+  Serial.print("ERRO DE DECODIFICACAO: ");
+  Serial.print(motivo);
+  Serial.print(" (simbolos: ");
+  Serial.print(simbolosRx);
+  Serial.println(")");
+}
+
+// Fecha o caractere em andamento, se houver. Ao final o
+// receptor sempre volta para o modo ALFA (modos sao
+// absolutos e valem para um unico caractere).
+void finalizarCaractere() {
+  if (simbolosRx.length() == 0) {
+    descartandoRx = false;
+    modoIdRx = ID_ALFA;
+    return;
+  }
+
+  char c = 0;
+  const char *motivo = nullptr;
+
+  if (descartandoRx) {
+    motivo = "sequencia longa demais";
+  }
+  else if (modoIdRx == ID_ALFA) {
+    c = decodificarMorse(simbolosRx);
+  }
+  else if (modoIdRx == ID_NUMERICO) {
+    c = decodificarNumero(simbolosRx);
+  }
+  else {
+    if ((int)simbolosRx.length() < BITS_ESPECIAL) {
+      motivo = "caractere especial incompleto";
+    }
+    else {
+      c = decodificarEspecial(simbolosRx);
+    }
+  }
+
+  if (motivo == nullptr && c == 0) {
+    motivo = "codigo invalido";
+  }
+
+  if (motivo != nullptr) {
+    adicionarErroCaractere(motivo);
+  }
+  else {
+    charsRx += c;
+
+    Serial.print("Caractere: '");
+    Serial.print(c);
+    Serial.print("' (modo ");
+    Serial.print(nomeDoModoId(modoIdRx));
+    Serial.println(")");
+  }
+
+  simbolosRx = "";
+  descartandoRx = false;
+  modoIdRx = ID_ALFA;
+}
+
+// Acrescenta um simbolo ao caractere em andamento. Se passar
+// do maximo do modo, o caractere inteiro e marcado como erro
+// e os simbolos restantes sao ignorados ate o proximo
+// intervalo de fim de caractere (sem erros em cascata).
+void acumularSimbolo(char simbolo) {
+  if (descartandoRx) {
+    return;
+  }
+
+  simbolosRx += simbolo;
+
+  unsigned int maximo = BITS_ESPECIAL;
+
+  if (modoIdRx == ID_ALFA) {
+    maximo = 4;
+  }
+  else if (modoIdRx == ID_NUMERICO) {
+    maximo = 3;
+  }
+
+  if (simbolosRx.length() > maximo) {
+    descartandoRx = true;
+  }
+}
+
+void iniciarMensagemRx() {
+  resetarRecepcao();
+
+  recebendoMensagem = true;
+  modoIdRx = ID_ALFA;
+
+  Serial.println("INICIO DA TRANSMISSAO RECEBIDA");
+}
+
+void finalizarMensagemRx() {
+  // Caractere ainda aberto no momento do controle final.
+  finalizarCaractere();
+
+  Serial.println("FIM DA TRANSMISSAO RECEBIDA");
+
+  Serial.println();
+  Serial.println("======================================");
+
+  int total = charsRx.length();
+
+  if (total == 0) {
+    Serial.println("MENSAGEM VAZIA (nenhum caractere decodificado).");
+    Serial.println("======================================");
+  }
+  else {
+    // O ultimo caractere recebido e o checksum.
+    char recebido = charsRx[total - 1];
+    String corpo = charsRx.substring(0, total - 1);
+    bool corpoComErro = (corpo.indexOf(CHAR_ERRO) >= 0);
+
+    Serial.println("TEXTO RECEBIDO:");
+    Serial.println(montarTextoRx(corpo));
+    Serial.println("======================================");
+
+    if (recebido == CHAR_ERRO) {
+      Serial.println(
+        "INTEGRIDADE: NAO VERIFICADA (checksum ilegivel)."
+      );
+    }
+    else if (corpoComErro) {
+      Serial.println(
+        "INTEGRIDADE: FALHOU (ha caracteres com [?])."
+      );
+    }
+    else {
+      char esperado = calcularChecksum(corpo);
+
+      if (esperado == recebido) {
+        Serial.println("INTEGRIDADE: OK (checksum confere).");
+      }
+      else {
+        Serial.print("INTEGRIDADE: FALHOU. Checksum recebido '");
+        Serial.print(recebido);
+        Serial.print("', esperado '");
+        Serial.print(esperado);
+        Serial.println(
+          "'. Algum bip foi lido errado, perdido ou inventado."
+        );
+      }
+    }
+  }
+
+  if (errosRx > 0) {
+    Serial.print("AVISO: ");
+    Serial.print(errosRx);
+    Serial.println(
+      " erro(s) de decodificacao; os trechos marcados com [?] "
+      "estao incorretos."
+    );
+  }
+
+  Serial.println();
+
+  totalMensagensRecebidas++;
+
+  Serial.print("Pulsos validos: ");
+  Serial.print(totalPulsosValidos);
+  Serial.print(" | invalidos: ");
+  Serial.print(totalPulsosInvalidos);
+  Serial.print(" | ruidos curtos filtrados: ");
+  Serial.print(totalRuidosFiltrados);
+  Serial.print(" | ruidos continuos: ");
+  Serial.println(totalRuidosContinuos);
+
+  // As contagens acima valem por mensagem.
+  totalPulsosValidos = 0;
+  totalPulsosInvalidos = 0;
+  totalRuidosFiltrados = 0;
+  totalRuidosContinuos = 0;
+
+  resetarRecepcao();
+}
+
+// ======================================================
+// PROCESSA UM PULSO RECEBIDO
+// Retorna true se o pulso foi aceito (e deve ser ecoado).
+// ======================================================
+
+bool processarPulso(const EventoPulso &ev, TipoSinal &tipoAceito) {
+  // Dentro de uma mensagem, desconta o desvio medido no controle
+  // inicial.
+  unsigned long duracao = ev.duracao;
+
+  if (COMPENSAR_COM_CONTROLE && recebendoMensagem && offsetRx != 0) {
+    long corrigida = (long)duracao - offsetRx;
+
+    if (corrigida < 0) {
+      corrigida = 0;
+    }
+
+    duracao = (unsigned long)corrigida;
+  }
+
+  TipoSinal tipo = classificarDuracao(duracao);
+
+  // Fora de mensagem, um LONGO "quase controle" e aceito como
+  // controle de inicio (o controle pode sair curto por AGC).
+  bool controleTolerado = false;
+
+  if (!recebendoMensagem &&
+      tipo == SINAL_LONGO &&
+      duracao >= LIM_CONTROLE_TOLERANTE_MS) {
+    tipo = SINAL_CONTROLE;
+    controleTolerado = true;
+  }
+
+  Serial.print("Pulso: ");
+  Serial.print(ev.duracao);
+
+  if (duracao != ev.duracao) {
+    Serial.print(" ms -> corrigido ");
+    Serial.print(duracao);
+  }
+
+  Serial.print(" ms (pico ");
+  Serial.print(ev.amplitudePico);
+  Serial.print(" @");
+  Serial.print(freqDoBin(ev.binPico));
+  Serial.print(" Hz) -> ");
+  Serial.print(nomeDoSinal(tipo));
+
+  if (controleTolerado) {
+    Serial.print(" (longo tolerado como controle de inicio)");
+  }
+
+  Serial.println();
+
+  if (tipo == SINAL_INVALIDO) {
+    totalPulsosInvalidos++;
+
+    Serial.println(
+      "Duracao fora dos limites (ruido): pulso rejeitado."
+    );
+
+    // Dentro de uma mensagem, o pulso rejeitado vira simbolo
+    // desconhecido: o caractere sai como [?].
+    if (recebendoMensagem) {
+      ultimaAtividadeRx = ev.fimMs;
+      acumularSimbolo('?');
+    }
+
+    return false;
+  }
+
+  totalPulsosValidos++;
+
+  // ---- Controle de inicio / fim ----
+  if (tipo == SINAL_CONTROLE) {
+    ultimaAtividadeRx = ev.fimMs;
+
+    if (!recebendoMensagem) {
+      iniciarMensagemRx();
+
+      if (COMPENSAR_COM_CONTROLE) {
+        long desvio = (long)ev.duracao - (long)DUR_CONTROLE_MS;
+
+        if (desvio > COMPENSACAO_MAX_MS) desvio = COMPENSACAO_MAX_MS;
+        if (desvio < -COMPENSACAO_MAX_MS) desvio = -COMPENSACAO_MAX_MS;
+
+        offsetRx = desvio;
+
+        Serial.print("Compensacao de duracao: ");
+        Serial.print(offsetRx);
+        Serial.println(" ms");
+      }
+    }
+    else {
+      finalizarMensagemRx();
+    }
+
+    tipoAceito = tipo;
+    return true;
+  }
+
+  if (!recebendoMensagem) {
+    Serial.println(
+      "Sinal ignorado: aguardando controle de inicio."
+    );
+
+    return false;
+  }
+
+  ultimaAtividadeRx = ev.fimMs;
+
+  // ---- Sinal de modo (absoluto, vale para o proximo caractere) ----
+  if (tipo == SINAL_MODO_NUMERICO ||
+      tipo == SINAL_MODO_ESPECIAL) {
+
+    // Os sinais de modo so existem entre caracteres. Se chegou
+    // no meio de um caractere, e quase certamente ruido (clique):
+    // ignora, sem estragar o caractere em andamento.
+    if (simbolosRx.length() > 0) {
+      Serial.println(
+        "Sinal de modo no meio de um caractere: ignorado "
+        "(provavel ruido)."
+      );
+
+      tipoAceito = tipo;
+      return true;
+    }
+
+    modoIdRx = (tipo == SINAL_MODO_NUMERICO) ? ID_NUMERICO : ID_ESPECIAL;
+
+    Serial.print("Modo do proximo caractere -> ");
+    Serial.println(nomeDoModoId(modoIdRx));
+
+    tipoAceito = tipo;
+    return true;
+  }
+
+  // ---- Bip de dados (curto ou longo) ----
+  acumularSimbolo(simboloChar(tipo, modoIdRx));
+
+  if ((int)charsRx.length() > MAX_CARACTERES_RX) {
+    Serial.println("ERRO: mensagem excedeu o limite de caracteres.");
+    resetarRecepcao();
+    return false;
+  }
+
+  tipoAceito = tipo;
+  return true;
+}
+
+// ======================================================
+// ECO DO PING-PONG
+//
+// Espera o som original terminar, aguarda ECO_ATRASO_MS e
+// devolve um bip com a mesma duracao nominal. Depois ignora
+// o microfone por um instante para nao processar o proprio
+// eco e reinicia o detector.
+// ======================================================
+
+bool emitirEco(TipoSinal tipo) {
+  if (!aguardarMs(ECO_ATRASO_MS)) {
+    return false;
+  }
+
+  Serial.print("PONG: devolvendo eco ");
+  Serial.print(nomeDoSinal(tipo));
+  Serial.print(" (");
+  Serial.print(duracaoDoSinal(tipo));
+  Serial.println(" ms).");
+
+  if (!tocarBip(duracaoDoSinal(tipo))) {
+    return false;
+  }
+
+  // O intervalo seguinte e contado a partir do fim do eco,
+  // que e o que o emissor tambem usa como referencia.
+  ultimaAtividadeRx = millis();
+
+  if (!aguardarMs(GUARDA_POS_EMISSAO_MS)) {
+    return false;
+  }
+
+  detectorReiniciar();
+
+  return true;
+}
+
+// ======================================================
+// TEMPOS DO RECEPTOR: fim de caractere e mensagem incompleta
+// ======================================================
+
+void verificarTemposReceptor() {
+  if (!recebendoMensagem || detSomAtivo) {
+    return;
+  }
+
+  unsigned long silencio = millis() - ultimaAtividadeRx;
+
+  if (silencio >= LIMITE_FIM_CARACTERE_MS) {
+    if (simbolosRx.length() > 0) {
+      finalizarCaractere();   // tambem volta para ALFA
+    }
+    else if (modoIdRx != ID_ALFA) {
+      // Sinal de modo sem bips depois (provavel ruido).
+      modoIdRx = ID_ALFA;
+    }
+  }
+
+  if (silencio >= TIMEOUT_MENSAGEM_MS) {
+    Serial.println(
+      "ERRO: tempo limite de mensagem incompleta. "
+      "Descartando e voltando a aguardar."
+    );
+
+    if (charsRx.length() > 0) {
+      Serial.print("Texto parcial descartado: ");
+      Serial.println(montarTextoRx(charsRx));
+    }
+
+    resetarRecepcao();
+  }
+}
+
+// ======================================================
+// CALIBRACAO
+// :C        liga/desliga a leitura continua da amplitude
+// :L<valor> ajusta o limiar minimo de deteccao (ex.: :L150)
+// ======================================================
+
+bool tratarComandoCalibracao(const String &comando) {
+  if (comandoEh(comando, ":C")) {
+    calibrando = !calibrando;
+
+    if (calibrando) {
+      calibInicioJanela = millis();
+      calibMaxJanela = 0;
+      calibSomaJanela = 0;
+      calibBlocosJanela = 0;
+      calibMaxTotal = 0;
+
+      Serial.println("CALIBRACAO ATIVADA.");
+      Serial.println(
+        "1) Deixe em silencio e anote o 'max total'."
+      );
+      Serial.println(
+        "2) Toque o buzzer e veja o 'max' durante os bips."
+      );
+      Serial.println(
+        "3) Use :L<valor> com um valor entre os dois."
+      );
+      Serial.println(
+        "4) O valor @... Hz e a frequencia do tom que o receptor ouve."
+      );
+      Serial.println("Digite :C para sair.");
+    }
+    else {
+      Serial.print("CALIBRACAO ENCERRADA. Maximo visto: ");
+      Serial.println(calibMaxTotal);
+    }
+
+    return true;
+  }
+
+  if (comando.length() > 2 &&
+      comando[0] == ':' &&
+      (comando[1] == 'L' || comando[1] == 'l') &&
+      soDigitos(comando, 2)) {
+
+    int valor = comando.substring(2).toInt();
+
+    if (valor < 10 || valor > LIMIAR_MAXIMO) {
+      Serial.print("Valor invalido. Use de 10 a ");
+      Serial.println(LIMIAR_MAXIMO);
+    }
+    else {
+      limiarMinimo = valor;
+      atualizarLimiares();
+
+      Serial.print("Limiar minimo ajustado para ");
+      Serial.print(limiarMinimo);
+      Serial.print(" (liga ");
+      Serial.print(limiarOn);
+      Serial.print(", desliga ");
+      Serial.print(limiarOff);
+      Serial.println(").");
+    }
+
+    return true;
+  }
+
+  // :T<hz> trava a escuta em torno de <hz> (+/- 2 bins, ~300 Hz).
+  // :T0 volta para a escuta automatica (1100 a 3400 Hz).
+  if (comando.length() > 2 &&
+      comando[0] == ':' &&
+      (comando[1] == 'T' || comando[1] == 't') &&
+      soDigitos(comando, 2)) {
+
+    int hz = comando.substring(2).toInt();
+
+    if (hz == 0) {
+      kMin = K_MIN_ABS;
+      kMax = K_MAX_ABS;
+
+      Serial.println("Escuta automatica (1100 a 3400 Hz).");
+    }
+    else if (hz < 1100 || hz > 3400) {
+      Serial.println("Frequencia invalida. Use de 1100 a 3400 Hz, ou 0.");
+      return true;
+    }
+    else {
+      int k = (int)(hz * BLOCO_AMOSTRAS / SAMPLING_FREQUENCY + 0.5);
+
+      kMin = k - 2;
+      kMax = k + 2;
+
+      if (kMin < K_MIN_ABS) kMin = K_MIN_ABS;
+      if (kMax > K_MAX_ABS) kMax = K_MAX_ABS;
+
+      Serial.print("Escuta travada de ");
+      Serial.print(freqDoBin(kMin));
+      Serial.print(" a ");
+      Serial.print(freqDoBin(kMax));
+      Serial.println(" Hz.");
+    }
+
+    detectorReiniciar();
+    semearRuido();
+
+    return true;
+  }
+
+  return false;
+}
+
+// Mostra a amplitude a cada 200 ms, sem processar pulsos.
+void executarCalibracao() {
+  int amplitude = lerAmplitudeBloco();
+
+  if (amplitude > calibMaxJanela) {
+    calibMaxJanela = amplitude;
+    calibBinJanela = binDominante;
+  }
+
+  if (amplitude > calibMaxTotal) {
+    calibMaxTotal = amplitude;
+  }
+
+  calibSomaJanela += amplitude;
+  calibBlocosJanela++;
+
+  if (millis() - calibInicioJanela >= 200) {
+    Serial.print("max=");
+    Serial.print(calibMaxJanela);
+    Serial.print(" @");
+    Serial.print(freqDoBin(calibBinJanela));
+    Serial.print(" Hz media=");
+    Serial.print(calibSomaJanela / calibBlocosJanela);
+    Serial.print(" | liga=");
+    Serial.print(limiarOn);
+    Serial.print(" desliga=");
+    Serial.print(limiarOff);
+    Serial.print(" | max total=");
+    Serial.println(calibMaxTotal);
+
+    calibInicioJanela = millis();
+    calibMaxJanela = 0;
+    calibSomaJanela = 0;
+    calibBlocosJanela = 0;
+  }
+}
+
+// ======================================================
+// MODO RECEBER
+// ======================================================
+
+void executarReceptor() {
+  String comando;
+
+  if (lerLinhaSerial(comando)) {
+    if (comandoEh(comando, ":E") ||
+        comandoEh(comando, ":EMITIR")) {
+      definirModo(EMITIR);
+      return;
+    }
+
+    if (!tratarComandoCalibracao(comando) &&
+        comando.length() > 0 &&
+        !comandoEh(comando, ":R") &&
+        !comandoEh(comando, ":RECEBER")) {
+      Serial.println(
+        "Para emitir, digite :E e pressione ENTER."
+      );
+    }
+  }
+
+  if (modoAtual != RECEBER) {
+    return;
+  }
+
+  if (calibrando) {
+    executarCalibracao();
+    return;
+  }
+
+  EventoPulso ev;
+
+  if (detectorProcessar(ev)) {
+    TipoSinal tipoAceito = SINAL_INVALIDO;
+
+    bool aceito = processarPulso(ev, tipoAceito);
+
+    if (PING_PONG_ATIVO && aceito && modoAtual == RECEBER) {
+      emitirEco(tipoAceito);
+    }
+
+    return;
+  }
+
+  verificarTemposReceptor();
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(MIC_PIN, INPUT);
+
+  // ADC do ESP32: 12 bits e faixa ~0 a 2,5 V (11 dB), que
+  // comporta a saida do MAX9814 (polarizada em ~1,25 V).
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  analogSetPinAttenuation(MIC_PIN, ADC_11db);
+
+  noTone(BUZZER_PIN);
+
+  inicializarGoertzel();
+
+  delay(1500);
+
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println("REC-WAVE v3");
+  Serial.println("RECEPTOR, EMISSOR E CONVERSOR");
+  Serial.println("PROTOCOLO POR DURACAO DOS BIPS");
+  Serial.println("======================================");
+  Serial.println();
+
+  // Mede o tempo de cada analogRead. A amostragem de 10 kHz
+  // exige menos de 100 us por amostra, ja contando uns 10 us
+  // do calculo dos filtros.
+  unsigned long t0 = micros();
+
+  for (int i = 0; i < 200; i++) {
+    analogRead(MIC_PIN);
+  }
+
+  float usPorLeitura = (micros() - t0) / 200.0f;
+
+  Serial.print("Tempo do analogRead: ");
+  Serial.print(usPorLeitura, 1);
+  Serial.println(" us (limite: 80 us)");
+
+  if (usPorLeitura > 80.0f) {
+    Serial.println(
+      "AVISO: ADC lento demais para 10 kHz. A taxa real fica "
+      "menor e as frequencias lidas saem deslocadas."
+    );
+  }
+
+  Serial.println();
+  Serial.println("Escolha o modo inicial:");
+  Serial.println("E = Emitir");
+  Serial.println("R = Receber");
+  Serial.println();
+}
+
+// ======================================================
+// LOOP PRINCIPAL
+// ======================================================
+
+void loop() {
+  if (modoAtual == MENU) {
+    String escolha;
+
+    if (lerLinhaSerial(escolha)) {
+      if (comandoEh(escolha, "E")) {
+        definirModo(EMITIR);
+      }
+      else if (comandoEh(escolha, "R")) {
+        definirModo(RECEBER);
+      }
+      else {
+        Serial.println(
+          "Digite E para emitir ou R para receber."
+        );
+      }
+    }
+
+    return;
+  }
+
+  if (modoAtual == EMITIR) {
+    String entrada;
+
+    if (lerLinhaSerial(entrada)) {
+      if (comandoEh(entrada, ":R") ||
+          comandoEh(entrada, ":RECEBER")) {
+        definirModo(RECEBER);
+      }
+      else if (comandoEh(entrada, ":E") ||
+               comandoEh(entrada, ":EMITIR")) {
+        Serial.println("O modo emissor ja esta ativo.");
+      }
+      else if (entrada.length() > 2 &&
+               entrada[0] == ':' &&
+               (entrada[1] == 'F' || entrada[1] == 'f') &&
+               soDigitos(entrada, 2)) {
+        testarFrequencia(entrada.substring(2).toInt());
+      }
+      else if (entrada.length() > 0) {
+        transmitirTexto(entrada);
+      }
+    }
+
+    return;
+  }
+
+  if (modoAtual == RECEBER) {
+    executarReceptor();
+  }
+}
